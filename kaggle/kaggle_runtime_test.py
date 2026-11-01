@@ -203,6 +203,107 @@ def test_precision_adapter_changes_only_frozen_model_loading():
     assert adapted.bridge == config.bridge
 
 
+@pytest.mark.parametrize("magnitude", [0.0, 0.001])
+def test_qwen_fp16_normalization_keeps_small_vector_gradients_finite(monkeypatch, magnitude):
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
+    original = qwen.l2norm
+    monkeypatch.setattr(qwen, "l2norm", original)  # Restore the global after this test.
+    values = torch.full((1, 4, 2, 16), magnitude, dtype=torch.float16, requires_grad=True)
+    weights = torch.arange(values.numel(), dtype=torch.float16).reshape_as(values) / values.numel()
+    output = original(values)
+    assert torch.isfinite(output).all()
+    (output * weights).sum().backward()
+    assert not torch.isfinite(values.grad).all()  # Regression in the pinned fallback.
+
+    runtime.enable_fp16_stability("fp16")
+    installed = qwen.l2norm
+    runtime.enable_fp16_stability("fp16")
+    assert qwen.l2norm is installed
+    values.grad = None
+    stable = qwen.l2norm(values)
+    (stable * weights).sum().backward()
+    reference = values.detach().double().requires_grad_()
+    normalized = reference / (reference.square().sum(-1, keepdim=True) + 1e-6).sqrt()
+    (normalized * weights.double()).sum().backward()
+    assert stable.dtype == values.dtype
+    assert torch.isfinite(values.grad).all()
+    torch.testing.assert_close(stable, normalized.half(), rtol=1e-3, atol=5e-4)
+    torch.testing.assert_close(values.grad, reference.grad.half(), rtol=1e-3, atol=5e-4)
+
+
+def test_runtime_installs_qwen_fp16_adapter_before_loading(monkeypatch):
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
+    original = qwen.l2norm
+    monkeypatch.setattr(qwen, "l2norm", original)
+    runtime.enable_fp16_stability("bf16")
+    assert qwen.l2norm is original
+    config = LatCommConfig.model_validate(config_dict(Path("data"), Path("output")))
+    def load(adapted, device, **kwargs):
+        assert getattr(qwen.l2norm, "_latcomm_fp32", False)
+        assert adapted.encoder.dtype == adapted.receiver.dtype == "float16"
+        assert device == "cpu" and kwargs == {"load_receiver": False}
+        return "loaded"
+    monkeypatch.setattr(runtime, "build_model", load)
+    assert runtime.build_runtime_model(config, "fp16", "cpu", load_receiver=False) == "loaded"
+    for dtype in (torch.bfloat16, torch.float32):
+        values = torch.randn(2, 3, 4, dtype=dtype)
+        assert torch.equal(qwen.l2norm(values), original(values))
+
+
+@pytest.mark.parametrize("checkpoint_layers", [False, True])
+def test_real_qwen_layers_and_latcomm_backward_are_finite_in_fp16(monkeypatch, checkpoint_layers):
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    monkeypatch.setattr(qwen, "l2norm", qwen.l2norm)
+    runtime.enable_fp16_stability("fp16")
+    config = Qwen3_5TextConfig(
+        vocab_size=80, hidden_size=32, intermediate_size=64, num_hidden_layers=4,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+        linear_key_head_dim=8, linear_value_head_dim=8,
+        linear_num_key_heads=2, linear_num_value_heads=4, max_position_embeddings=128,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 1.0},
+    )
+    config._attn_implementation = "sdpa"
+    receiver = qwen.Qwen3_5ForCausalLM(config).half().requires_grad_(False).eval()
+    # Zero Q/K is a valid input to normalization and reliably triggers the old
+    # backward failure. Test the real hybrid layers, reader hooks and CE path.
+    with torch.no_grad():
+        for layer in receiver.model.layers:
+            if hasattr(layer, "linear_attn"):
+                layer.linear_attn.in_proj_qkv.weight.zero_()
+    encoder = TinyLM(hidden_size=24, num_layers=4).requires_grad_(False).eval()
+    pairs = select_layer_pairs(4, 4, 1.0)
+    bridge = LatentBridge(pairs, 24, 32, BridgeConfig(
+        context_dim=8, num_slots=2, num_attention_heads=2, gate_pooling_dim=8))
+    model = LatCommModel(wrap_frozen_lm(encoder, "cpu"), wrap_frozen_lm(receiver, "cpu"), bridge)
+    if checkpoint_layers:
+        model.enable_gradient_checkpointing()
+    model.train()
+    batch = {
+        "context": {"input_ids": torch.tensor([[3, 4, 5, 6]]), "attention_mask": torch.ones(1, 4, dtype=torch.long)},
+        "prompt": {"input_ids": torch.tensor([[1, 7, 8, 9, 10, 11, 12, 13]]),
+                   "attention_mask": torch.ones(1, 8, dtype=torch.long),
+                   "prompt_end_positions": torch.tensor([2]),
+                   "prediction_positions": torch.tensor([[2, 3, 4, 5, 6]])},
+        "response_ids": torch.tensor([[9, 10, 11, 12, 13]]),
+        "response_mask": torch.ones(1, 5, dtype=torch.bool),
+    }
+    optimizer = torch.optim.AdamW(bridge.parameters(), lr=1e-3)
+    scaler = torch.amp.GradScaler("cpu", enabled=False)
+    before = bridge.readers[0].output_projection.weight.detach().clone()
+    for _ in range(2):
+        score, _ = runtime.forward_backward(model, batch, scaler)
+        assert torch.isfinite(score.nll).all()
+        gradients = [parameter.grad for parameter in bridge.parameters() if parameter.grad is not None]
+        assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients)
+        torch.nn.utils.clip_grad_norm_(bridge.parameters(), 1.0, error_if_nonfinite=True)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+    assert not torch.equal(bridge.readers[0].output_projection.weight, before)
+    assert all(not parameter.requires_grad and parameter.grad is None for parameter in receiver.parameters())
+
+
 def test_overflow_retries_identical_update_without_skipping_examples(tmp_path, monkeypatch):
     data = tmp_path / "data"
     write_data(data)

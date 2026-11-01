@@ -160,6 +160,40 @@ def precision_config(config: LatCommConfig, precision: str) -> LatCommConfig:
     })
 
 
+def enable_fp16_stability(precision: str) -> None:
+    """Keep Qwen3.5's fallback Q/K normalization backward out of FP16.
+
+    Transformers 5.15.1 normalizes Q/K before the delta-rule fallback upcasts
+    them. At zero or small vectors, rsqrt backward overflows its FP16
+    intermediates even when the output and upstream gradient are finite.
+    Reducing the loss scale cannot fix that intermediate overflow. Keep this
+    normalization in FP32 and cast its result back to the backbone dtype.
+    The frozen weights, architecture, epsilon and training objective stay put.
+    """
+    if precision != "fp16":
+        return
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+
+    original = modeling_qwen3_5.l2norm
+    if getattr(original, "_latcomm_fp32", False):
+        return
+
+    def stable_l2norm(x, dim=-1, eps=1e-6):
+        if x.dtype != torch.float16:
+            return original(x, dim=dim, eps=eps)
+        work = x.float()
+        return (work * torch.rsqrt((work * work).sum(dim=dim, keepdim=True) + eps)).to(x.dtype)
+
+    stable_l2norm._latcomm_fp32 = True
+    modeling_qwen3_5.l2norm = stable_l2norm
+    LOGGER.info("FP16 stability: Qwen3.5 fallback Q/K L2 normalization computes in FP32")
+
+
+def build_runtime_model(config, precision: str, device, **kwargs):
+    enable_fp16_stability(precision)
+    return build_model(precision_config(config, precision), device, **kwargs)
+
+
 def code_identity(source_commit: str) -> dict[str, Any]:
     import latcomm
     package = Path(latcomm.__file__).resolve().parent
@@ -506,8 +540,8 @@ def _train(config, args, distributed) -> int:
             return 0
 
     LOGGER.info("rank %d: loading models; memory=%s", distributed.rank, json.dumps(memory_snapshot()))
-    model = build_model(precision_config(config, args.precision), distributed.device,
-                        load_encoder=config.data.packet_cache is None)
+    model = build_runtime_model(config, args.precision, distributed.device,
+                                load_encoder=config.data.packet_cache is None)
     LOGGER.info("rank %d: models loaded; memory=%s", distributed.rank, json.dumps(memory_snapshot()))
     if config.training.init_checkpoint:
         load_bridge(config.training.init_checkpoint, model.bridge)
@@ -814,7 +848,7 @@ def _encode(config, args, distributed) -> int:
             "or choose a larger writable packet-cache directory."
         )
     seed_everything(config.training.seed)
-    model = build_model(precision_config(config, args.precision), distributed.device, load_receiver=False)
+    model = build_runtime_model(config, args.precision, distributed.device, load_receiver=False)
     load_bridge(args.checkpoint, model.bridge)
     if list(model.bridge.packet_shape) != packet_shape or compressor_hash(model.bridge) != provenance["compressor"]:
         raise ValueError("Checkpoint metadata differs from its actual compressor tensors")
@@ -908,8 +942,8 @@ def evaluate_command(args) -> int:
         if config.data.packet_cache:
             identity = packet_fingerprint(config.data.packet_cache)
             packets = PacketCache(config.data.packet_cache)
-        model = build_model(precision_config(config, args.precision), distributed.device,
-                            load_encoder=packets is None)
+        model = build_runtime_model(config, args.precision, distributed.device,
+                                    load_encoder=packets is None)
         load_bridge(args.checkpoint, model.bridge)
         if identity and identity["meta"]["provenance"]["compressor"] != compressor_hash(model.bridge):
             raise ValueError("Evaluation cache comes from different compressors")
