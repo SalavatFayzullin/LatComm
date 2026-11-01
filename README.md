@@ -57,6 +57,11 @@ pinned environment, and runs `kaggle/run.py` from that checkout. Commit and push
 `kaggle/` directory to the selected branch before using it. Checkpoints record the
 source commit so later sessions can restore the same code.
 
+The default `kaggle` profile is a reduced experiment: Qwen3.5-0.8B to itself,
+2,048 reconstruction passages, 128 training questions per task, and global batch 32
+(64 Stage 1 updates and 144 Stage 2 updates). It preserves the method with a smaller
+training budget; use `--profile full` explicitly for the original data budget.
+
 See [`kaggle/README_RU.md`](kaggle/README_RU.md) for data, hardware, and resume settings.
 
 ## Data

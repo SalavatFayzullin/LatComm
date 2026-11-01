@@ -51,6 +51,34 @@ SESSION_LIMIT_EXIT = 75
 SHARD_ROWS = 64
 
 
+def memory_snapshot() -> dict[str, float]:
+    result = {}
+    if torch.cuda.is_available():
+        result["gpu_allocated_gib"] = round(torch.cuda.memory_allocated() / 1024**3, 3)
+        result["gpu_reserved_gib"] = round(torch.cuda.memory_reserved() / 1024**3, 3)
+        result["gpu_peak_gib"] = round(torch.cuda.max_memory_allocated() / 1024**3, 3)
+    try:
+        import psutil
+        result["process_ram_gib"] = round(psutil.Process().memory_info().rss / 1024**3, 3)
+        result["system_ram_available_gib"] = round(psutil.virtual_memory().available / 1024**3, 3)
+    except ImportError:
+        pass
+    for limit_path, used_path in (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+    ):
+        try:
+            limit = int(Path(limit_path).read_text().strip())
+            used = int(Path(used_path).read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if 0 < limit < 2**60:
+            result["container_ram_limit_gib"] = round(limit / 1024**3, 3)
+            result["container_ram_used_gib"] = round(used / 1024**3, 3)
+            break
+    return result
+
+
 class MicrobatchProgress:
     """Report completed work without CUDA synchronization or RNG changes."""
 
@@ -72,7 +100,7 @@ class MicrobatchProgress:
     def emit(self, kind: str, **values) -> None:
         LOGGER.info("%s", json.dumps({"type": kind, "rank": self.rank,
                                       "next_step": self.next_step, "mode": self.mode,
-                                      "retry": self.retry, **values}))
+                                      "retry": self.retry, **memory_snapshot(), **values}))
 
     def phase(self, name: str) -> None:
         if self.completed == 0:
@@ -372,7 +400,8 @@ def forward_backward(model, batch, scaler) -> tuple[Any, torch.Tensor]:
     with model.reading(packet, batch["prompt"]) as reader:
         if reporter:
             reporter.phase("receiver_forward")
-        score = score_responses(response_logits(model.receiver, batch["prompt"]), batch)
+        score = score_responses(response_logits(model.receiver, batch["prompt"]), batch,
+                                checkpoint_loss=True)
         loss = score.nll.sum() / LOSS_NORMALIZER
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError("Non-finite loss; selected backbone precision overflowed")
@@ -476,9 +505,10 @@ def _train(config, args, distributed) -> int:
             LOGGER.info("Run already completed at %s", resume)
             return 0
 
-    LOGGER.info("rank %d: loading models", distributed.rank)
+    LOGGER.info("rank %d: loading models; memory=%s", distributed.rank, json.dumps(memory_snapshot()))
     model = build_model(precision_config(config, args.precision), distributed.device,
                         load_encoder=config.data.packet_cache is None)
+    LOGGER.info("rank %d: models loaded; memory=%s", distributed.rank, json.dumps(memory_snapshot()))
     if config.training.init_checkpoint:
         load_bridge(config.training.init_checkpoint, model.bridge)
     if cache_identity is not None:
@@ -514,6 +544,10 @@ def _train(config, args, distributed) -> int:
     total_steps = config.training.max_steps or config.training.num_epochs * steps_per_epoch
     if total_steps <= 0:
         raise ValueError("Training schedule is empty")
+    LOGGER.info("%s", json.dumps({"type": "training_plan", "rank": distributed.rank,
+                "examples": len(train_examples), "epochs": config.training.num_epochs,
+                "global_batch": config.training.per_device_batch_size * accumulation * distributed.world_size,
+                "accumulation": accumulation, "total_steps": total_steps}))
     optimizer = torch.optim.AdamW(parameters, lr=config.training.learning_rate,
                                   weight_decay=config.training.weight_decay)
     scheduler = build_scheduler(optimizer, config, total_steps)

@@ -95,9 +95,11 @@ def checkout(args) -> tuple[Path, str]:
 
 def training_arguments(args):
     command = [args.action, "--workdir", str(args.workdir), "--profile", args.profile,
-               "--pair", args.pair, "--gpus", str(args.gpus), "--microbatch", str(args.microbatch),
+               "--gpus", str(args.gpus), "--microbatch", str(args.microbatch),
                "--precision", args.precision, "--session-steps", str(args.session_steps),
                "--session-hours", str(args.session_hours), "--checkpoint-every", str(args.checkpoint_every)]
+    if args.pair:
+        command += ["--pair", args.pair]
     for name in ("restore", "data_source", "data_dir", "packet_cache", "data_revision"):
         value = getattr(args, name)
         if value is not None:
@@ -114,14 +116,14 @@ def main(argv=None) -> int:
     parser.add_argument("--commit", help="Optional full SHA; saved runs automatically pin their original SHA.")
     parser.add_argument("--repo-dir", type=Path, default=Path("/kaggle/working/LatComm"))
     parser.add_argument("--workdir", type=Path)
-    parser.add_argument("--profile", choices=("full", "smoke"), default="full")
-    parser.add_argument("--pair", default="qwen4b_to_qwen0.8b")
+    parser.add_argument("--profile", choices=("kaggle", "full", "smoke"), default="kaggle")
+    parser.add_argument("--pair", help="Omit to use the profile's model pair")
     parser.add_argument("--action", choices=("setup", "prepare", "stage1", "encode", "stage2", "evaluate", "all"), default="all")
     parser.add_argument("--gpus", type=int, default=0)
     parser.add_argument("--microbatch", type=int, default=1)
     parser.add_argument("--precision", choices=("auto", "fp16", "bf16"), default="auto")
-    parser.add_argument("--session-steps", type=int, default=25)
-    parser.add_argument("--session-hours", type=float, default=8.0)
+    parser.add_argument("--session-steps", type=int, default=0)
+    parser.add_argument("--session-hours", type=float, default=0)
     parser.add_argument("--checkpoint-every", type=int, default=5)
     parser.add_argument("--benchmark-microbatches", type=int, default=0)
     parser.add_argument("--restore", type=Path)

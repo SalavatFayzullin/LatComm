@@ -174,3 +174,41 @@ def test_benchmark_runs_stage1_only_instead_of_continuing_pipeline(tmp_path, mon
     assert launch.call_count == 1
     assert launch.call_args.args[5] == "stage1"
     assert launch.call_args.args[0].benchmark_microbatches == 3
+
+
+def test_kaggle_profile_changes_budget_but_keeps_method(tmp_path):
+    args = options(tmp_path, profile="kaggle", pair="qwen0.8b_to_qwen0.8b")
+    state = {"models": {side: {"revision": "pinned"} for side in ("encoder", "receiver")}}
+    paths = run.configure(args, REPO, state, {}, 2)
+    expected = {"stage1": (2048, 1, 64, 2, "all", "constant"),
+                "stage2": (1536, 3, 144, 3, "readers_and_gates", "cosine")}
+    for stage, (examples, epochs, updates, warmup, trainable, scheduler) in expected.items():
+        config = yaml.safe_load(paths[stage].read_text())
+        original = yaml.safe_load((REPO / "configs" / stage / f"{args.pair}.yaml").read_text())
+        training = config["training"]
+        assert config["bridge"] == original["bridge"]
+        assert training["per_device_batch_size"] * training["gradient_accumulation_steps"] * 2 == 32
+        assert (examples + 31) // 32 * epochs == updates
+        assert training["warmup_steps"] == warmup
+        assert training["trainable"] == trainable
+        assert training["scheduler"] == scheduler
+        assert training["num_epochs"] == epochs
+        assert config["receiver"]["model_name_or_path"] == config["encoder"]["model_name_or_path"] == "Qwen/Qwen3.5-0.8B"
+
+
+@pytest.mark.parametrize("profile,pair", [("kaggle", "qwen0.8b_to_qwen0.8b"),
+                                         ("full", "qwen4b_to_qwen0.8b"),
+                                         ("smoke", "qwen4b_to_qwen0.8b")])
+def test_profile_defaults_are_explicit_and_have_no_extra_stop_caps(tmp_path, monkeypatch, profile, pair):
+    import data_utils
+    captured = []
+    monkeypatch.setattr(run, "source_identity", lambda _: {"source_commit": "a" * 40})
+    def state(args, *_):
+        captured.append(args)
+        return {"dataset_revision": "data-sha"}
+    monkeypatch.setattr(run, "manifest", state)
+    monkeypatch.setattr(data_utils, "prepare_data", lambda *_args, **_kwargs: {})
+    monkeypatch.setenv("LATCOMM_INDEX_DIR", str(tmp_path / "indexes"))
+    assert run.main(["prepare", "--profile", profile, "--workdir", str(tmp_path / "run")]) == 0
+    assert captured[0].pair == pair
+    assert captured[0].session_steps == captured[0].session_hours == 0

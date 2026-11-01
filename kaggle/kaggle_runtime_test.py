@@ -302,3 +302,51 @@ def test_benchmark_skips_evaluation_and_never_updates_weights(tmp_path, monkeypa
     assert result["ranks"][0]["finite_gradients"]
     assert result["rough_update_seconds"] > 0
     assert not (output / "checkpoints").exists()
+
+
+def test_reduced_profile_prepares_data_and_completes_both_stages(tmp_path, monkeypatch):
+    import data_utils
+    spec = importlib.util.spec_from_file_location("pilot_run_config", KAGGLE / "run.py")
+    orchestration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(orchestration)
+    policy = {"seed": 42,
+              "stage1": {"train": 32, "dev": 2, "fast_dev": 2, "test": 2},
+              "stage2_per_dataset": {"train": 4, "dev": 2, "fast_dev": 2, "test": 2},
+              "stage2_datasets": 3}
+    monkeypatch.setattr(data_utils, "KAGGLE_POLICY", policy)
+    source = tmp_path / "source"
+    write_data(source / "stage1", count=40)
+    # prepare_data also preserves a dev split for a complete local source.
+    shutil.copy2(source / "stage1/fast_dev.jsonl", source / "stage1/dev.jsonl")
+    task_root = source / "stage2"
+    task_root.mkdir(parents=True)
+    for split in ("train", "dev", "fast_dev", "test"):
+        rows = []
+        for group in range(3):
+            for index in range(5):
+                context = f"context {group} {index}"
+                rows.append({"sample_id": f"{split}-{group}-{index}", "question": "Which?",
+                             "choices": ["alpha", "beta"], "response": "AB"[index % 2],
+                             "evidence": [{"source_record_id": context, "text": context}],
+                             "provenance": {"dataset": f"task-{group}"}})
+        (task_root / f"{split}.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    prepared = tmp_path / "data"
+    receipt = data_utils.prepare_data(prepared, revision="fixed", profile="kaggle", local_source=source)
+    args = argparse.Namespace(profile="kaggle", pair="qwen0.8b_to_qwen0.8b", data_dir=prepared,
+                              workdir=tmp_path / "run", packet_cache=tmp_path / "packets",
+                              microbatch=2, checkpoint_every=1)
+    state = {"models": {side: {"revision": "fixed"} for side in ("encoder", "receiver")}}
+    configs = orchestration.configure(args, REPO, state, receipt, 1)
+    assert runtime.train(train_args(configs["stage1"])) == 0
+    final1 = args.workdir / "outputs/stage1/checkpoints/final"
+    encoded = argparse.Namespace(config=str(configs["stage2"]), checkpoint=str(final1), output=str(args.packet_cache),
+                                 precision="bf16", batch_size=2, splits=None, source_commit="cpu-test-source")
+    assert runtime.encode(encoded) == 0
+    assert runtime.train(train_args(configs["stage2"])) == 0
+    final2 = args.workdir / "outputs/stage2/checkpoints/final"
+    evaluated = argparse.Namespace(config=str(configs["stage2"]), checkpoint=str(final2),
+                                   data=str(prepared / "stage2/test.jsonl"), output=str(args.workdir / "results"),
+                                   precision="bf16", source_commit="cpu-test-source")
+    assert runtime.evaluate_command(evaluated) == 0
+    metrics = json.loads((args.workdir / "results/metrics.json").read_text())
+    assert len([name for name in metrics if name.startswith("accuracy/")]) == 3

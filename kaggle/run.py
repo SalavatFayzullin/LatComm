@@ -18,6 +18,10 @@ PAIRS = ("qwen4b_to_qwen0.8b", "qwen0.8b_to_qwen0.8b")
 HERE = Path(__file__).resolve().parent
 
 
+def global_batch_size(profile: str) -> int:
+    return 32 if profile == "kaggle" else 384
+
+
 def call(command, **kwargs):
     print("+", " ".join(map(str, command)), flush=True)
     return subprocess.run(list(map(str, command)), check=True, **kwargs)
@@ -67,8 +71,9 @@ def hardware(args):
         raise RuntimeError("Enable a GPU accelerator in Kaggle Notebook settings.")
     count = torch.cuda.device_count()
     processes = count if args.gpus == 0 else args.gpus
-    if processes > count or processes < 1 or 384 % (processes * args.microbatch):
-        raise ValueError("GPU count * microbatch must divide the global batch size 384.")
+    batch = global_batch_size(args.profile)
+    if processes > count or processes < 1 or batch % (processes * args.microbatch):
+        raise ValueError(f"GPU count * microbatch must divide the global batch size {batch}.")
     devices = []
     for i in range(processes):
         prop = torch.cuda.get_device_properties(i)
@@ -83,8 +88,8 @@ def hardware(args):
     if precision == "bf16" and not bf16:
         raise RuntimeError("Native BF16 needs an Ampere-or-newer GPU. Use --precision fp16 on T4/P100.")
     print(json.dumps({"devices": devices, "precision": precision,
-                      "global_batch": 384, "microbatch": args.microbatch,
-                      "accumulation": 384 // (processes * args.microbatch)}, indent=2), flush=True)
+                      "global_batch": batch, "microbatch": args.microbatch,
+                      "accumulation": batch // (processes * args.microbatch)}, indent=2), flush=True)
     if precision == "fp16":
         print("Numerical deviation from the paper: frozen LLMs FP16, interface/AdamW FP32, "
               "dynamic loss scaling. Stored packets remain BF16. Architecture and objective are unchanged.", flush=True)
@@ -116,6 +121,7 @@ def manifest(args, repo: Path, source: dict[str, str]):
         models[side] = {"name": name, "revision": api.model_info(name).sha}
     result = {**source,
               "pair": args.pair, "profile": args.profile,
+              "global_batch_size": global_batch_size(args.profile),
               "dataset": "huaweilin/LatComm",
               "dataset_revision": api.dataset_info("huaweilin/LatComm", revision=args.data_revision).sha,
               "models": models}
@@ -127,6 +133,7 @@ def configure(args, repo: Path, state, data, processes: int):
     import yaml
 
     configs = {}
+    batch = global_batch_size(args.profile)
     for stage in ("stage1", "stage2"):
         config = yaml.safe_load((repo / "configs" / stage / f"{args.pair}.yaml").read_text())
         for side in ("encoder", "receiver"):
@@ -135,7 +142,7 @@ def configure(args, repo: Path, state, data, processes: int):
         config["training"].update(output_dir=str(args.workdir / "outputs" / stage),
                                   per_device_batch_size=args.microbatch,
                                   per_device_eval_batch_size=1,
-                                  gradient_accumulation_steps=384 // (processes * args.microbatch),
+                                  gradient_accumulation_steps=batch // (processes * args.microbatch),
                                   log_every=1, eval_every=100, save_every=args.checkpoint_every)
         if stage == "stage2":
             config["data"]["packet_cache"] = str(args.packet_cache)
@@ -144,6 +151,14 @@ def configure(args, repo: Path, state, data, processes: int):
             # This is a distinct, explicitly labelled experiment, not paper results.
             # Keep the two training stages, schedule shape and global batch 384.
             config["training"]["warmup_steps"] = 0
+        elif args.profile == "kaggle":
+            from data_utils import kaggle_count
+            examples = data.get("files", {}).get(f"{stage}/train.jsonl", {}).get(
+                "records", kaggle_count(stage, "train"))
+            updates = (examples + batch - 1) // batch * config["training"]["num_epochs"]
+            original_updates = 5209 if stage == "stage1" else 2208
+            config["training"]["warmup_steps"] = max(
+                1, round(config["training"]["warmup_steps"] * updates / original_updates))
         path = args.workdir / "configs" / f"{stage}.yaml"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -204,28 +219,30 @@ def launch(args, repo, configs, processes, precision, stage, source_commit):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("action", choices=("setup", "prepare", "stage1", "encode", "stage2", "evaluate", "all"))
-    p.add_argument("--workdir", type=Path, default=Path("/kaggle/working/latcomm"))
+    p.add_argument("--workdir", type=Path)
     p.add_argument("--data-dir", type=Path, help="Prepared JSONL data directory (stage1/ and stage2/).")
     p.add_argument("--data-source", type=Path, help="Local copy of the HF repository or prepared data; avoids download.")
     p.add_argument("--packet-cache", type=Path, help="Can point at a persisted /kaggle/input packet directory.")
     p.add_argument("--restore", type=Path, help="Previous saved workdir; restore outputs/manifest, do not copy packet shards.")
-    p.add_argument("--pair", choices=PAIRS, default=PAIRS[0])
-    p.add_argument("--profile", choices=("full", "smoke"), default="full")
+    p.add_argument("--pair", choices=PAIRS, help="Default: 0.8B -> 0.8B for kaggle, 4B -> 0.8B otherwise")
+    p.add_argument("--profile", choices=("kaggle", "full", "smoke"), default="kaggle")
     p.add_argument("--data-revision", help="Optional HF commit; resolved and pinned on first run.")
     p.add_argument("--precision", choices=("auto", "fp16", "bf16"), default="auto")
     p.add_argument("--gpus", type=int, default=0, help="0: all visible GPUs; 1 or 2: explicit count.")
     p.add_argument("--microbatch", type=int, default=1)
-    p.add_argument("--session-steps", type=int, default=25, help="New optimizer updates per invocation; 0: no step cap.")
-    p.add_argument("--session-hours", type=float, default=8.0, help="Graceful stop at next completed update; 0: no time cap.")
+    p.add_argument("--session-steps", type=int, default=0, help="New optimizer updates per invocation; 0: no step cap.")
+    p.add_argument("--session-hours", type=float, default=0, help="Graceful stop at next completed update; 0: no time cap.")
     p.add_argument("--checkpoint-every", type=int, default=5)
     p.add_argument("--benchmark-microbatches", type=int, default=0,
                    help="Time N Stage 1 microbatches without optimizer updates; use a fresh workdir")
     args = p.parse_args(argv)
+    if args.pair is None:
+        args.pair = PAIRS[1] if args.profile == "kaggle" else PAIRS[0]
     if args.microbatch < 1 or args.checkpoint_every < 1 or args.session_steps < 0 or args.session_hours < 0 or args.benchmark_microbatches < 0:
         p.error("microbatch/checkpoint interval must be positive; session limits cannot be negative")
     if args.benchmark_microbatches and args.action not in ("all", "stage1"):
         p.error("--benchmark-microbatches is supported with all or stage1 only")
-    args.workdir = args.workdir.resolve()
+    args.workdir = (args.workdir or Path(f"/kaggle/working/latcomm-{args.profile}")).resolve()
     args.data_dir = (args.data_dir or args.workdir / "data").resolve()
     args.packet_cache = (args.packet_cache or args.workdir / "packets").resolve()
     args.workdir.mkdir(parents=True, exist_ok=True)

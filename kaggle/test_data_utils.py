@@ -95,3 +95,43 @@ def test_inspect_unterminated_last_record(tmp_path):
     path = tmp_path / "two.jsonl"
     path.write_bytes(b"{}\n{}")
     assert data.inspect_jsonl(path)["records"] == 2
+
+
+def test_kaggle_sampling_is_balanced_reproducible_and_preserves_records(tmp_path, monkeypatch):
+    policy = {"seed": 42,
+              "stage1": {"train": 20, "dev": 4, "fast_dev": 4, "test": 4},
+              "stage2_per_dataset": {"train": 3, "dev": 2, "fast_dev": 2, "test": 2},
+              "stage2_datasets": 3}
+    monkeypatch.setattr(data, "KAGGLE_POLICY", policy)
+    source = tmp_path / "source"
+    for split in data.SPLITS:
+        write(source / "stage1" / f"{split}.jsonl", [record(i) for i in range(80)])
+        rows = []
+        for group in ("first", "second", "third"):
+            for index in range(12):
+                row = record(index, mcq=True)
+                row["sample_id"] = f"{group}-{index}"
+                row["provenance"]["dataset"] = group
+                rows.append(row)
+        write(source / "stage2" / f"{split}.jsonl", rows)
+    first, second = tmp_path / "first", tmp_path / "second"
+    receipt = data.prepare_data(first, revision="fixed", profile="kaggle", local_source=source)
+    again = data.prepare_data(second, revision="fixed", profile="kaggle", local_source=source)
+    assert receipt["sampling"] == policy
+    assert receipt["files"] == again["files"]
+    assert receipt["files"]["stage2/train.jsonl"]["datasets"] == {"first": 3, "second": 3, "third": 3}
+    for relative, info in receipt["files"].items():
+        assert (first / relative).read_bytes() == (second / relative).read_bytes()
+        source_name = relative.replace("fast_dev", "dev") if relative.startswith("stage2") else relative
+        originals = set((source / source_name).read_bytes().splitlines())
+        assert all(line in originals for line in (first / relative).read_bytes().splitlines())
+    assert (first / "stage2/dev.jsonl").read_bytes() == (first / "stage2/fast_dev.jsonl").read_bytes()
+    # Reservoir sampling is not the first N lines of a source grouped by task.
+    assert (first / "stage1/train.jsonl").read_bytes().splitlines() != (source / "stage1/train.jsonl").read_bytes().splitlines()[:20]
+
+
+def test_kaggle_rejects_a_source_missing_tasks(tmp_path, monkeypatch):
+    import io
+    monkeypatch.setitem(data.KAGGLE_POLICY, "stage2_per_dataset", {"train": 1})
+    with pytest.raises(ValueError, match="Cannot sample"):
+        data.sample_kaggle(io.BytesIO(json.dumps(record(0, mcq=True)).encode() + b"\n"), "stage2", "train")

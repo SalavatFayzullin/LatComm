@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from latcomm.data import MCQ_LETTERS
 from latcomm.distributed import DistributedContext
@@ -27,19 +28,24 @@ class Score:
     predictions: torch.Tensor | None  # [B] index of the predicted option, multiple choice only
 
 
-def score_responses(logits: torch.Tensor, batch: Mapping[str, Any]) -> Score:
+def _token_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    return F.cross_entropy(logits.float().flatten(0, 1), labels.flatten(),
+                           reduction="none", ignore_index=-100).view(logits.shape[:2])
+
+
+def score_responses(logits: torch.Tensor, batch: Mapping[str, Any], *, checkpoint_loss: bool = False) -> Score:
     response_ids = batch["response_ids"].to(logits.device)
     mask = batch["response_mask"].to(logits.device)
     labels = response_ids.masked_fill(~mask, -100)
-    # Cast to 32-bit floats a few positions at a time; a full float copy of the logits is large.
+    # Training otherwise retains FP32 log-softmax buffers from *all* chunks until
+    # backward. Checkpointing recomputes each chunk and keeps those buffers local
+    # to that chunk, with the same CE objective and gradients.
     nll = torch.cat(
         [
-            F.cross_entropy(
-                logits[:, start : start + 32].float().flatten(0, 1),
-                labels[:, start : start + 32].flatten(),
-                reduction="none",
-                ignore_index=-100,
-            ).view(logits.shape[0], -1)
+            checkpoint(_token_cross_entropy, logits[:, start : start + 32], labels[:, start : start + 32],
+                       use_reentrant=False, preserve_rng_state=False)
+            if checkpoint_loss and torch.is_grad_enabled() and logits.requires_grad
+            else _token_cross_entropy(logits[:, start : start + 32], labels[:, start : start + 32])
             for start in range(0, logits.shape[1], 32)
         ],
         dim=1,

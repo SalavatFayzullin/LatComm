@@ -11,6 +11,7 @@ import gzip
 import json
 import os
 from pathlib import Path
+import random
 import shutil
 import struct
 import time
@@ -25,6 +26,48 @@ SPLITS = {"train": "train", "dev": "validation", "fast_dev": "fast_validation", 
 EXPECTED = {"stage1": {"train": 2_000_000, "dev": 15_043, "test": 14_983},
             "stage2": {"train": 282_441, "dev": 2_036, "test": 55_890}}
 INDEX_VERSION = 1
+KAGGLE_POLICY = {
+    "seed": 42,
+    "stage1": {"train": 2048, "dev": 64, "fast_dev": 64, "test": 64},
+    "stage2_per_dataset": {"train": 128, "dev": 4, "fast_dev": 4, "test": 16},
+    "stage2_datasets": 12,
+}
+
+
+def kaggle_count(stage, split):
+    if stage == "stage1":
+        return KAGGLE_POLICY["stage1"][split]
+    return KAGGLE_POLICY["stage2_per_dataset"][split] * KAGGLE_POLICY["stage2_datasets"]
+
+
+def sample_kaggle(src, stage, split):
+    """Uniform reservoir sampling; Stage 2 has an independent reservoir per task.
+
+    Read the entire source split, retaining only the selected original lines.
+    This avoids taking only the first dataset when source records are grouped.
+    """
+    seed_split = "dev" if stage == "stage2" and split == "fast_dev" else split
+    material = f"{KAGGLE_POLICY['seed']}:{stage}:{seed_split}".encode()
+    rng = random.Random(int(sha256(material).hexdigest(), 16))
+    limit = KAGGLE_POLICY["stage1"][split] if stage == "stage1" else KAGGLE_POLICY["stage2_per_dataset"][split]
+    pools, counts = {}, {}
+    for position, line in enumerate(src):
+        group = "all" if stage == "stage1" else json.loads(line)["provenance"]["dataset"]
+        pool = pools.setdefault(group, [])
+        counts[group] = counts.get(group, 0) + 1
+        if len(pool) < limit:
+            pool.append((position, line))
+        else:
+            chosen = rng.randrange(counts[group])
+            if chosen < limit:
+                pool[chosen] = (position, line)
+        if (position + 1) % 250_000 == 0:
+            print(f"Sampling {stage}/{split}: scanned {position + 1:,} source records", flush=True)
+    expected_groups = 1 if stage == "stage1" else KAGGLE_POLICY["stage2_datasets"]
+    if len(pools) != expected_groups or any(len(pool) != limit for pool in pools.values()):
+        raise ValueError(f"Cannot sample {limit} records from each of {expected_groups} groups: {counts}")
+    selected = sorted((item for pool in pools.values() for item in pool), key=lambda item: item[0])
+    return [line for _, line in selected]
 
 
 def digest_file(path):
@@ -58,17 +101,20 @@ def prepare_data(root: Path, *, revision: str, profile: str = "full", token=None
                  local_source: Path | None = None) -> dict:
     """Download original gz files at a pinned commit, or use a local source copy.
 
+    `kaggle` samples 2,048 reconstruction records and 128 questions per task.
     `smoke` explicitly keeps the first 384 train records and 16 per eval split.
     Full data is never truncated, re-split, or re-formatted.
     """
     root = Path(root)
-    if profile not in ("full", "smoke"):
-        raise ValueError("profile must be full or smoke")
+    if profile not in ("full", "smoke", "kaggle"):
+        raise ValueError("profile must be full, smoke or kaggle")
     receipt = root / "preparation.json"
     if receipt.exists():
         saved = json.loads(receipt.read_text(encoding="utf-8"))
         if saved["revision"] != revision or saved["profile"] != profile:
             raise ValueError("Prepared data revision/profile changed; use a separate data directory")
+        if profile == "kaggle" and saved.get("sampling") != KAGGLE_POLICY:
+            raise ValueError("Sampling policy changed; use a separate data directory")
         for relative, info in saved["files"].items():
             path = root / relative
             if not path.is_file() or digest_file(path) != info["sha256"]:
@@ -81,8 +127,14 @@ def prepare_data(root: Path, *, revision: str, profile: str = "full", token=None
         root.mkdir(parents=True, exist_ok=True)
     result = {"dataset": DATASET, "revision": revision, "profile": profile,
               "source": "local" if local_source or preexisting else "huggingface", "files": {}}
+    if profile == "kaggle":
+        result["sampling"] = KAGGLE_POLICY
     for stage, folder in FOLDERS.items():
         for split, remote_split in SPLITS.items():
+            # Use the complete validation suite to retain every task in fast_dev.
+            source_split = "dev" if profile == "kaggle" and stage == "stage2" and split == "fast_dev" else split
+            if source_split != split:
+                remote_split = SPLITS[source_split]
             relative = f"{stage}/{split}.jsonl"
             target = root / relative
             if not preexisting:
@@ -90,7 +142,7 @@ def prepare_data(root: Path, *, revision: str, profile: str = "full", token=None
                 source = None
                 if local_source:
                     local_source = Path(local_source)
-                    candidates = (local_source / stage / f"{split}.jsonl",
+                    candidates = (local_source / stage / f"{source_split}.jsonl",
                                   local_source / folder / f"{remote_split}.jsonl.gz")
                     source = next((p for p in candidates if p.is_file()), None)
                     if source is None:
@@ -103,7 +155,9 @@ def prepare_data(root: Path, *, revision: str, profile: str = "full", token=None
                 opener = gzip.open if source.suffix == ".gz" else open
                 try:
                     with opener(source, "rb") as src, temporary.open("wb") as out:
-                        if profile == "smoke":
+                        if profile == "kaggle":
+                            out.writelines(sample_kaggle(src, stage, split))
+                        elif profile == "smoke":
                             limit = 384 if split == "train" else 16
                             for index, line in enumerate(src):
                                 if index >= limit:
@@ -117,9 +171,22 @@ def prepare_data(root: Path, *, revision: str, profile: str = "full", token=None
                 finally:
                     temporary.unlink(missing_ok=True)
             info = inspect_jsonl(target)
-            expected = EXPECTED[stage].get(split) if profile == "full" else (384 if split == "train" else 16)
+            expected = (kaggle_count(stage, split) if profile == "kaggle" else
+                        EXPECTED[stage].get(split) if profile == "full" else
+                        (384 if split == "train" else 16))
             if not info["records"] or expected is not None and info["records"] != expected:
                 raise ValueError(f"Unexpected record count in {target}: {info['records']} (expected {expected})")
+            if profile == "kaggle" and stage == "stage2":
+                groups = {}
+                with target.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        group = json.loads(line)["provenance"]["dataset"]
+                        groups[group] = groups.get(group, 0) + 1
+                if len(groups) != KAGGLE_POLICY["stage2_datasets"] or any(
+                    size != KAGGLE_POLICY["stage2_per_dataset"][split] for size in groups.values()
+                ):
+                    raise ValueError(f"Sample is not balanced across the Stage 2 tasks: {groups}")
+                info["datasets"] = dict(sorted(groups.items()))
             result["files"][relative] = info
             print(f"Data {relative}: {info['records']:,} records", flush=True)
     if os.access(root, os.W_OK):

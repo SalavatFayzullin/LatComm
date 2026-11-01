@@ -1,6 +1,5 @@
 """Build the lightweight Kaggle bootstrap notebook and source bundle."""
 from pathlib import Path
-from copy import deepcopy
 import json
 import zipfile
 
@@ -22,8 +21,18 @@ cells = [cell("markdown", """# LatComm: запуск из своего форк�
 
 В Kaggle включите **Internet** и **GPU T4 ×2** или **P100**.
 Данные авторов загружаются автоматически с Hugging Face.
-`PROFILE = "full"` использует полный набор; `"smoke"` проверяет всю цепочку на малой выборке.
-Даже в smoke исходный архив Stage 1 (около 2,8 GB) скачивается целиком.
+По умолчанию выбран уменьшенный эксперимент **`PROFILE = "kaggle"`**:
+
+- Qwen3.5-0.8B → Qwen3.5-0.8B; обе LLM заморожены.
+- Stage 1: 2048 текстов, одна эпоха, 64 обновления.
+- Stage 2: по 128 вопросов из каждого из 12 наборов, три эпохи, 144 обновления.
+- Global batch 32, microbatch 1; на двух GPU накопление составляет 16 микробатчей.
+- Тест: по 16 вопросов из каждого набора, всего 192.
+
+Архитектура, два этапа и функция потерь соответствуют методу статьи. Объём данных,
+batch и warmup уменьшены; метрики такого эксперимента не воспроизводят таблицы статьи.
+Исходный архив Stage 1 (около 2,8 GB) всё равно скачивается и просматривается потоком.
+`PROFILE = "full"` явно включает исходный полный бюджет, `"smoke"` — короткую проверку цепочки.
 
 Новый запуск берёт `REPO_REF`. Для продолжения обучения используется SHA из сохранённого
 `manifest.json`, чтобы обновление ветки main не изменило код посреди эксперимента.
@@ -36,15 +45,15 @@ REPO_URL = "https://github.com/SalavatFayzullin/LatComm.git"
 REPO_REF = "main"                       # branch/tag for a new experiment
 SOURCE_COMMIT = None                    # optional full SHA for a fixed version
 REPO_DIR = "/kaggle/working/LatComm"     # source code from your fork
-PROFILE = "full"                       # "smoke" for a small pipeline check
+PROFILE = "kaggle"                     # 2048 Stage 1 + 128 questions/task; full and smoke are optional
 WORKDIR = f"/kaggle/working/latcomm-{PROFILE}"  # checkpoints/results, separate from source
-PAIR = "qwen4b_to_qwen0.8b"             # alternative: qwen0.8b_to_qwen0.8b
+PAIR = None                           # kaggle: 0.8B -> 0.8B; full/smoke: 4B -> 0.8B
 ACTION = "all"                         # setup, prepare, stage1, encode, stage2, evaluate, all
 NUM_GPUS = 0                           # 0 = all visible GPUs
-SESSION_STEPS = 25                     # new updates per session, full schedule is retained
-SESSION_HOURS = 8.0                    # graceful stop at the next optimizer boundary
+SESSION_STEPS = 0                      # 0: finish training; optional per-session update cap
+SESSION_HOURS = 0.0                    # 0: no extra script time limit; Kaggle limits still apply
 BENCHMARK_MICROBATCHES = 0              # 3 = time only 3 microbatches; use a fresh WORKDIR
-RESTORE = None                        # e.g. /kaggle/input/previous-output/latcomm-full
+RESTORE = None                        # e.g. /kaggle/input/previous-output/latcomm-kaggle
 DATA_SOURCE = None                    # optional local copy of published data
 DATA_DIR = f"/kaggle/temp/latcomm-data-{PROFILE}"
 PACKET_CACHE = WORKDIR + "/packets"    # full cache can require tens of GB
@@ -73,18 +82,21 @@ cells += [cell("markdown", """## Клонирование, установка и
 Повторное клонирование репозитория авторов не выполняется.
 Установка и обучение идут в отдельных Python-процессах.
 
-PyTorch закреплён на **2.11.0 cu126** для T4/P100; Transformers — **5.15.1**.
+Установщик использует PyTorch **2.11.0** и индекс cu126; Transformers — **5.15.1**.
+Совместимая установленная сборка PyTorch может быть сохранена pip (например, cu128 на T4).
 На этих GPU LLM работают в FP16, обучаемый интерфейс — в FP32, пакеты хранятся в BF16.
 Это сохраняет алгоритм и отличается по вычислительной точности от H100 авторов.
 """), cell("code", '''command = [sys.executable, str(BOOTSTRAP_FILE),
            "--repo-url", REPO_URL, "--ref", REPO_REF, "--repo-dir", REPO_DIR,
-           "--workdir", WORKDIR, "--profile", PROFILE, "--pair", PAIR,
+           "--workdir", WORKDIR, "--profile", PROFILE,
            "--action", ACTION, "--gpus", str(NUM_GPUS),
            "--session-steps", str(SESSION_STEPS), "--session-hours", str(SESSION_HOURS),
            "--benchmark-microbatches", str(BENCHMARK_MICROBATCHES),
            "--data-dir", DATA_DIR, "--packet-cache", PACKET_CACHE]
 if SOURCE_COMMIT:
     command += ["--commit", SOURCE_COMMIT]
+if PAIR:
+    command += ["--pair", PAIR]
 if RESTORE:
     command += ["--restore", RESTORE]
 if DATA_SOURCE:
@@ -106,11 +118,12 @@ elif result.returncode:
 `/kaggle/temp` не сохраняется; JSONL и модели можно скачать повторно с закреплённых ревизий.
 Кэш пакетов сохраняется отдельно. Его полный объём может превышать лимит сохраняемого output Kaggle.
 Готовый совместимый кэш можно подключить из `/kaggle/input/...` через `PACKET_CACHE`.
-Полный эксперимент требует многих сессий; `SESSION_STEPS` ограничивает текущую сессию.
+Полный эксперимент требует многих сессий. Уменьшенный профиль выполняет 208 обновлений;
+фактическое время и достаточность памяти нужно оценивать по текущему запуску.
 """), cell("code", '''import json
 benchmark = Path(WORKDIR) / "outputs/stage1/benchmark.json"
 metrics = Path(WORKDIR) / "results/metrics.json"
-if benchmark.exists():
+if BENCHMARK_MICROBATCHES and benchmark.exists():
     print(json.dumps(json.loads(benchmark.read_text()), indent=2, ensure_ascii=False))
 elif metrics.exists():
     print(json.dumps(json.loads(metrics.read_text()), indent=2, ensure_ascii=False))
@@ -132,27 +145,8 @@ except ImportError:
     pass
 else:
     nbformat.validate(notebook)
-diagnostic = deepcopy(notebook)
-diagnostic["cells"][0]["source"] = [
-    "# LatComm: диагностика скорости\n",
-    "\nСначала отправьте обновлённую папку `kaggle/` в свой форк.\n",
-    "Этот запуск измеряет **3 микробатча** Stage 1 без обновления весов и без начальной оценки на 256 примерах.\n",
-    "Используется отдельный WORKDIR; существующие checkpoints сохраняются.\n",
-    "Вывод показывает rank, фазу encoder/receiver/backward и время каждого микробатча.\n",
-    "Оценка времени полного шага приблизительная; данные и модели всё равно должны быть загружены.\n",
-]
-settings = "".join(diagnostic["cells"][1]["source"])
-settings = settings.replace('WORKDIR = f"/kaggle/working/latcomm-{PROFILE}"',
-                            'WORKDIR = "/kaggle/working/latcomm-benchmark"')
-settings = settings.replace('ACTION = "all"', 'ACTION = "stage1"')
-settings = settings.replace('BENCHMARK_MICROBATCHES = 0', 'BENCHMARK_MICROBATCHES = 3')
-diagnostic["cells"][1]["source"] = settings.splitlines(keepends=True)
-diagnostic_path = ROOT / "LatComm_Diagnostic.ipynb"
-diagnostic_path.write_text(json.dumps(diagnostic, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
-for item in diagnostic["cells"]:
-    if item["cell_type"] == "code":
-        compile("".join(item["source"]), "diagnostic-notebook-cell", "exec")
 with zipfile.ZipFile(ROOT / "LatComm_Kaggle.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
-    for name in ("bootstrap.py", "run.py", "data_utils.py", "runtime.py", "README_RU.md", target.name, diagnostic_path.name):
+    for name in ("bootstrap.py", "run.py", "data_utils.py", "runtime.py", "README_RU.md", target.name):
         archive.write(ROOT / name, "kaggle/" + name)
+    archive.write(ROOT.parent / "latcomm/evaluate.py", "latcomm/evaluate.py")
 print(target)
