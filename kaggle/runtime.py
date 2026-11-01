@@ -51,6 +51,55 @@ SESSION_LIMIT_EXIT = 75
 SHARD_ROWS = 64
 
 
+class MicrobatchProgress:
+    """Report completed work without CUDA synchronization or RNG changes."""
+
+    def __init__(self, rank: int, *, interval: float = 30.0):
+        self.rank = rank
+        self.interval = interval
+        self.completed = 0
+        self.retry = 0
+
+    def start(self, next_step: int, target: int, *, phase: str = "train") -> None:
+        self.next_step = next_step
+        self.target = target
+        self.mode = phase
+        self.completed = 0
+        self.retry = 0
+        self.started = self.last_report = self.batch_started = time.monotonic()
+        self.emit("update_start", microbatches=target)
+
+    def emit(self, kind: str, **values) -> None:
+        LOGGER.info("%s", json.dumps({"type": kind, "rank": self.rank,
+                                      "next_step": self.next_step, "mode": self.mode,
+                                      "retry": self.retry, **values}))
+
+    def phase(self, name: str) -> None:
+        if self.completed == 0:
+            self.emit("microbatch_phase", microbatch=1, phase=name)
+
+    def begin_microbatch(self) -> None:
+        self.batch_started = time.monotonic()
+
+    def finish_microbatch(self) -> None:
+        self.completed += 1
+        now = time.monotonic()
+        if self.completed == 1 or self.completed == self.target or now - self.last_report >= self.interval:
+            elapsed = now - self.started
+            self.emit("microbatch_progress", microbatch=self.completed, accumulation=self.target,
+                      microbatch_seconds=round(now - self.batch_started, 3),
+                      elapsed_seconds=round(elapsed, 3))
+            self.last_report = now
+
+    def repeat(self, attempt: int, old_scale: float, new_scale: float) -> None:
+        self.retry = attempt
+        LOGGER.warning("%s", json.dumps({"type": "fp16_retry", "rank": self.rank,
+                       "next_step": self.next_step, "attempt": attempt,
+                       "microbatches_to_repeat": self.target,
+                       "old_loss_scale": old_scale, "new_loss_scale": new_scale}))
+        self.completed = 0
+
+
 def file_hash(path: str | Path) -> str:
     digest = sha256()
     with Path(path).open("rb") as handle:
@@ -314,19 +363,74 @@ def resolve_resume(output: Path, requested: str) -> Path | None:
 
 
 def forward_backward(model, batch, scaler) -> tuple[Any, torch.Tensor]:
+    reporter = getattr(model, "_microbatch_progress", None)
+    if reporter:
+        reporter.phase("packet_read" if "packet" in batch else "encoder_and_compressors")
     packet = batch["packet"] if "packet" in batch else model.encode_context(batch["context"])
     if not bool(torch.isfinite(packet).all()):
         raise FloatingPointError("Non-finite context packet; selected backbone precision overflowed")
     with model.reading(packet, batch["prompt"]) as reader:
+        if reporter:
+            reporter.phase("receiver_forward")
         score = score_responses(response_logits(model.receiver, batch["prompt"]), batch)
         loss = score.nll.sum() / LOSS_NORMALIZER
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError("Non-finite loss; selected backbone precision overflowed")
         # Keep hooks active through checkpoint recomputation. FP32 bridge arithmetic
         # is deliberate: no autocast surrounds the bridge, pooling, or gate softmax.
+        if reporter:
+            reporter.phase("backward")
         scaler.scale(loss).backward()
     gate = torch.stack(list(reader.gates.values())).mean()
     return score, gate
+
+
+def benchmark_microbatches(model, loader, optimizer, scaler, args, distributed, output, accumulation):
+    """Measure real forward/backward calls without making an optimizer update."""
+    count = min(args.benchmark_microbatches, len(loader))
+    reporter = MicrobatchProgress(distributed.rank, interval=0.0)
+    model._microbatch_progress = reporter
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    reporter.start(1, count, phase="benchmark")
+    started = time.monotonic()
+    durations = []
+    examples = 0
+    # Length sorting puts the shortest examples first. Sample across the first
+    # update instead of benchmarking only its shortest few microbatches.
+    width = min(len(loader), max(accumulation, count))
+    batches = list(islice(iter(loader.batch_sampler), width))
+    positions = [i * (width - 1) // max(1, count - 1) for i in range(count)]
+    for position in positions:
+        batch = loader.collate_fn([loader.dataset[index] for index in batches[position]])
+        reporter.begin_microbatch()
+        before = time.monotonic()
+        forward_backward(model, batch, scaler)
+        # Benchmark timings include completed GPU work, rather than only the
+        # asynchronous launches. Normal training synchronizes scalar statistics.
+        examples += len(batch["ids"])
+        if distributed.device.type == "cuda":
+            torch.cuda.synchronize(distributed.device)
+        durations.append(time.monotonic() - before)
+        reporter.finish_microbatch()
+    scaler.unscale_(optimizer)
+    finite = all(parameter.grad is None or bool(torch.isfinite(parameter.grad).all())
+                 for group in optimizer.param_groups for parameter in group["params"])
+    own = {"rank": distributed.rank, "microbatches": count, "examples": examples,
+           "sampled_microbatch_positions": positions,
+           "elapsed_seconds": time.monotonic() - started,
+           "seconds_per_microbatch": sum(durations) / len(durations),
+           "microbatch_seconds": durations, "finite_gradients": finite}
+    ranks = distributed.all_gather(own)
+    result = {"type": "benchmark", "optimizer_updates": 0, "ranks": ranks,
+              "gradient_accumulation_steps": accumulation,
+              "rough_update_seconds": max(rank["seconds_per_microbatch"] for rank in ranks) * accumulation,
+              "note": "Small cold-start sample; excludes optimizer/communication time and full-update overflow retries."}
+    optimizer.zero_grad(set_to_none=True)
+    if distributed.is_main:
+        atomic_json(output / "benchmark.json", result)
+        LOGGER.info("%s", json.dumps(result))
+    return 0
 
 
 def train(args) -> int:
@@ -345,6 +449,8 @@ def _train(config, args, distributed) -> int:
         (output / "session-paused.json").unlink(missing_ok=True)
     distributed.barrier()
     resume = resolve_resume(output, args.resume)
+    if getattr(args, "benchmark_microbatches", 0) and resume is not None:
+        raise ValueError("Benchmark requires a fresh workdir; existing training checkpoints are preserved")
     seed_everything(config.training.seed)
     np.random.seed(config.training.seed)
     cache_identity = packet_fingerprint(config.data.packet_cache) if config.data.packet_cache else None
@@ -370,6 +476,7 @@ def _train(config, args, distributed) -> int:
             LOGGER.info("Run already completed at %s", resume)
             return 0
 
+    LOGGER.info("rank %d: loading models", distributed.rank)
     model = build_model(precision_config(config, args.precision), distributed.device,
                         load_encoder=config.data.packet_cache is None)
     if config.training.init_checkpoint:
@@ -395,6 +502,7 @@ def _train(config, args, distributed) -> int:
     packets = PacketCache(config.data.packet_cache) if config.data.packet_cache else None
     collator = Collator(load_tokenizer(config.encoder), load_tokenizer(config.receiver), config.data,
                         with_context=packets is None, packets=packets)
+    LOGGER.info("rank %d: opening/indexing train and eval data", distributed.rank)
     train_examples = IndexedExamples(train_path, config.data)
     eval_examples = IndexedExamples(eval_path, config.data)
     if not len(train_examples) or len(eval_examples) < distributed.world_size:
@@ -411,6 +519,8 @@ def _train(config, args, distributed) -> int:
     scheduler = build_scheduler(optimizer, config, total_steps)
     scaler = torch.amp.GradScaler("cuda", enabled=args.precision == "fp16" and distributed.device.type == "cuda",
                                   init_scale=1024.0)
+    if getattr(args, "benchmark_microbatches", 0):
+        return benchmark_microbatches(model, loader, optimizer, scaler, args, distributed, output, accumulation)
     progress = {"step": 0, "epoch": 0, "next_batch": 0, "overflow_retries": 0}
     if state is not None:
         load_bridge(resume, model.bridge)
@@ -445,6 +555,7 @@ def _train(config, args, distributed) -> int:
     def evaluate_now():
         # Evaluation is deterministic and must not perturb continuation RNG.
         previous_rng = rng_state()
+        LOGGER.info("rank %d: evaluation starting at optimizer step %d", distributed.rank, progress["step"])
         try:
             metrics, _ = upstream_evaluate(model, eval_loader, distributed)
             log("eval", metrics)
@@ -453,8 +564,11 @@ def _train(config, args, distributed) -> int:
 
     def save(complete=False):
         name = "final" if complete else f"step-{progress['step']:08d}"
-        return save_training_checkpoint(output, name, model, config, optimizer, scheduler, scaler,
+        LOGGER.info("rank %d: saving checkpoint %s", distributed.rank, name)
+        result = save_training_checkpoint(output, name, model, config, optimizer, scheduler, scaler,
                                          distributed, fingerprint, dict(progress), complete=complete, statistics=dict(stats))
+        LOGGER.info("rank %d: checkpoint %s saved", distributed.rank, name)
+        return result
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -468,9 +582,12 @@ def _train(config, args, distributed) -> int:
     micro_steps = 0
     buffered_batches = []
     update_rng = update_stats = None
+    reporter = MicrobatchProgress(distributed.rank)
+    model._microbatch_progress = reporter
 
     def accumulate(batch):
         nonlocal update_tokens
+        reporter.begin_microbatch()
         score, gate = forward_backward(model, batch, scaler)
         tokens = int(score.token_counts.sum())
         examples = len(batch["ids"])
@@ -482,6 +599,7 @@ def _train(config, args, distributed) -> int:
         stats["gate"] += float(gate) * examples
         if score.predictions is not None:
             stats["correct"] += int((score.predictions.cpu() == batch["gold_options"]).sum())
+        reporter.finish_microbatch()
 
     while progress["step"] < total_steps:
         epoch = progress["epoch"]
@@ -493,6 +611,8 @@ def _train(config, args, distributed) -> int:
             if micro_steps == 0:
                 update_rng, update_stats = rng_state(), dict(stats)
                 buffered_batches = []
+                reporter.start(progress["step"] + 1,
+                               min(accumulation, loader.batch_sampler.full_length - batch_index))
             buffered_batches.append(batch)
             accumulate(batch)
             micro_steps += 1
@@ -512,10 +632,12 @@ def _train(config, args, distributed) -> int:
                     break
                 if not scaler.is_enabled():
                     raise FloatingPointError("Non-finite FP32 bridge gradients")
-                scaler.update(new_scale=scaler.get_scale() / 2)
+                old_scale = scaler.get_scale()
+                scaler.update(new_scale=old_scale / 2)
                 optimizer.zero_grad(set_to_none=True)
                 consecutive_overflows += 1
                 next_progress["overflow_retries"] += 1
+                reporter.repeat(consecutive_overflows, old_scale, scaler.get_scale())
                 if consecutive_overflows >= 16:
                     raise FloatingPointError("FP16 gradients overflowed in 16 consecutive updates")
                 # Replay exactly the same update and stochastic operations. No
@@ -526,6 +648,7 @@ def _train(config, args, distributed) -> int:
                 for retry_batch in buffered_batches:
                     accumulate(retry_batch)
             consecutive_overflows = 0
+            reporter.emit("optimizer_update", phase="gradient_reduction_and_step")
             total_tokens = distributed.sum(update_tokens)
             distributed.sum_gradients(parameters)  # Float32 sum, not a world-size mean.
             for parameter in parameters:
@@ -547,7 +670,8 @@ def _train(config, args, distributed) -> int:
                            "token_accuracy": merged["correct_tokens"] / merged["tokens"],
                            "gate_mean": merged["gate"] / merged["examples"],
                            "grad_norm": float(norm), "lr": scheduler.get_last_lr()[0],
-                           "loss_scale": scaler.get_scale()}
+                           "loss_scale": scaler.get_scale(),
+                           "step_seconds": round(time.monotonic() - reporter.started, 3)}
                 if config.data.response_format == "mcq":
                     metrics["accuracy"] = merged["correct"] / merged["examples"]
                 log("train", metrics)
@@ -574,7 +698,7 @@ def _train(config, args, distributed) -> int:
                 distributed.barrier()
                 LOGGER.info("Session limit reached; resume with --resume auto (exit 75)")
                 return SESSION_LIMIT_EXIT
-        # An overflowing last update still advanced the dataset position.
+        # A finished data pass must advance the epoch cursor.
         if progress["epoch"] == epoch:
             raise RuntimeError("Training made no progress through its data epoch")
     raise RuntimeError("Unexpected end of training")
@@ -809,6 +933,8 @@ def parser() -> argparse.ArgumentParser:
             command.add_argument("--session-steps", type=int, default=0)
             command.add_argument("--session-hours", type=float, default=0)
             command.add_argument("--checkpoint-every", type=int, default=25)
+            command.add_argument("--benchmark-microbatches", type=int, default=0,
+                                 help="Time N microbatches without optimizer updates; requires a fresh workdir")
         if name == "encode":
             command.add_argument("--batch-size", type=int, default=1)
             command.add_argument("--splits", nargs="+")
@@ -821,7 +947,7 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     args = parser().parse_args(argv)
     if args.command == "train":
-        if args.session_steps < 0 or args.session_hours < 0 or args.checkpoint_every < 1:
+        if args.session_steps < 0 or args.session_hours < 0 or args.checkpoint_every < 1 or args.benchmark_microbatches < 0:
             raise ValueError("Session limits must be nonnegative and checkpoint interval positive")
         return train(args)
     if args.command == "encode":

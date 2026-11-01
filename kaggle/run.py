@@ -179,6 +179,8 @@ def launch(args, repo, configs, processes, precision, stage, source_commit):
                    "--resume", "auto", "--session-steps", str(args.session_steps),
                    "--session-hours", str(args.session_hours), "--checkpoint-every", str(args.checkpoint_every),
                    "--source-commit", source_commit]
+        if args.benchmark_microbatches:
+            command += ["--benchmark-microbatches", str(args.benchmark_microbatches)]
     elif stage == "encode":
         command = ["encode", "--config", str(configs["stage2"]), "--precision", precision,
                    "--checkpoint", str(args.workdir / "outputs/stage1/checkpoints/final"),
@@ -216,9 +218,13 @@ def main(argv=None):
     p.add_argument("--session-steps", type=int, default=25, help="New optimizer updates per invocation; 0: no step cap.")
     p.add_argument("--session-hours", type=float, default=8.0, help="Graceful stop at next completed update; 0: no time cap.")
     p.add_argument("--checkpoint-every", type=int, default=5)
+    p.add_argument("--benchmark-microbatches", type=int, default=0,
+                   help="Time N Stage 1 microbatches without optimizer updates; use a fresh workdir")
     args = p.parse_args(argv)
-    if args.microbatch < 1 or args.checkpoint_every < 1 or args.session_steps < 0 or args.session_hours < 0:
+    if args.microbatch < 1 or args.checkpoint_every < 1 or args.session_steps < 0 or args.session_hours < 0 or args.benchmark_microbatches < 0:
         p.error("microbatch/checkpoint interval must be positive; session limits cannot be negative")
+    if args.benchmark_microbatches and args.action not in ("all", "stage1"):
+        p.error("--benchmark-microbatches is supported with all or stage1 only")
     args.workdir = args.workdir.resolve()
     args.data_dir = (args.data_dir or args.workdir / "data").resolve()
     args.packet_cache = (args.packet_cache or args.workdir / "packets").resolve()
@@ -234,6 +240,7 @@ def main(argv=None):
     source = source_identity(repo)
     state = manifest(args, repo, source)
     from data_utils import prepare_data
+    print("Preparing/verifying dataset files...", flush=True)
     data = prepare_data(args.data_dir, revision=state["dataset_revision"], profile=args.profile,
                         local_source=args.data_source)
     if args.action == "prepare":
@@ -243,7 +250,8 @@ def main(argv=None):
     configs = configure(args, repo, state, data, processes)
     atomic_json(args.workdir / "hardware.json", {"devices": devices, "precision": precision,
                                                 "torch": __import__("torch").__version__})
-    stages = ("stage1", "encode", "stage2", "evaluate") if args.action == "all" else (args.action,)
+    stages = (("stage1",) if args.benchmark_microbatches else
+              (("stage1", "encode", "stage2", "evaluate") if args.action == "all" else (args.action,)))
     for stage in stages:
         status = launch(args, repo, configs, processes, precision, stage, source["source_commit"])
         if status:

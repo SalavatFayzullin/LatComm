@@ -134,3 +134,14 @@ def test_skip_setup_only_runs_requested_action(remote, tmp_path, monkeypatch):
                            "--workdir", str(tmp_path / "work"), "--action", "prepare", "--skip-setup"]) == 0
     records = [json.loads(line) for line in log.read_text().splitlines()]
     assert [r["args"][0] for r in records] == ["prepare"]
+
+
+def test_benchmark_flag_is_forwarded_to_fork_script(remote, tmp_path, monkeypatch):
+    log = tmp_path / "calls.jsonl"
+    monkeypatch.setenv("BOOTSTRAP_LOG", str(log))
+    assert bootstrap.main(["--repo-url", str(remote), "--repo-dir", str(tmp_path / "clone"),
+                           "--workdir", str(tmp_path / "work"), "--benchmark-microbatches", "3",
+                           "--skip-setup"]) == 0
+    record = json.loads(log.read_text().splitlines()[0])
+    arguments = record["args"]
+    assert arguments[arguments.index("--benchmark-microbatches") + 1] == "3"

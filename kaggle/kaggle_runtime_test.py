@@ -266,3 +266,39 @@ def test_encoding_disk_preflight_runs_before_loading_models(tmp_path, monkeypatc
                               splits=None, source_commit="cpu-test-source")
     with pytest.raises(OSError, match="Insufficient disk"):
         runtime.encode(args)
+
+
+def test_progress_reports_microbatches_and_fp16_retries(caplog):
+    import logging
+    progress = runtime.MicrobatchProgress(1, interval=0.0)
+    with caplog.at_level(logging.INFO, logger=runtime.LOGGER.name):
+        progress.start(1, 192)
+        progress.phase("backward")
+        progress.begin_microbatch()
+        progress.finish_microbatch()
+        progress.repeat(1, 1024, 512)
+        progress.phase("encoder_and_compressors")
+    events = [json.loads(record.message) for record in caplog.records]
+    completed = next(event for event in events if event["type"] == "microbatch_progress")
+    assert completed["rank"] == 1 and completed["microbatch"] == 1 and completed["accumulation"] == 192
+    retry = next(event for event in events if event["type"] == "fp16_retry")
+    assert retry["microbatches_to_repeat"] == 192 and retry["new_loss_scale"] == 512
+
+
+def test_benchmark_skips_evaluation_and_never_updates_weights(tmp_path, monkeypatch):
+    data, output = tmp_path / "data", tmp_path / "benchmark"
+    write_data(data)
+    config = tmp_path / "config.yaml"
+    save_config(config, config_dict(data, output))
+    args = train_args(config)
+    args.benchmark_microbatches = 3
+    monkeypatch.setattr(runtime, "upstream_evaluate", lambda *_: pytest.fail("benchmark ran full evaluation"))
+    monkeypatch.setattr(torch.optim.AdamW, "step", lambda *_args, **_kwargs: pytest.fail("benchmark updated weights"))
+    assert runtime.train(args) == 0
+    result = json.loads((output / "benchmark.json").read_text())
+    assert result["optimizer_updates"] == 0
+    assert result["ranks"][0]["microbatches"] == 3
+    assert result["ranks"][0]["sampled_microbatch_positions"] == [0, 1, 2]
+    assert result["ranks"][0]["finite_gradients"]
+    assert result["rough_update_seconds"] > 0
+    assert not (output / "checkpoints").exists()

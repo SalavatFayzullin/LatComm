@@ -102,6 +102,8 @@ def training_arguments(args):
         value = getattr(args, name)
         if value is not None:
             command += ["--" + name.replace("_", "-"), str(value)]
+    if args.benchmark_microbatches:
+        command += ["--benchmark-microbatches", str(args.benchmark_microbatches)]
     return command
 
 
@@ -121,6 +123,7 @@ def main(argv=None) -> int:
     parser.add_argument("--session-steps", type=int, default=25)
     parser.add_argument("--session-hours", type=float, default=8.0)
     parser.add_argument("--checkpoint-every", type=int, default=5)
+    parser.add_argument("--benchmark-microbatches", type=int, default=0)
     parser.add_argument("--restore", type=Path)
     parser.add_argument("--data-source", type=Path)
     parser.add_argument("--data-dir", type=Path)
@@ -131,7 +134,7 @@ def main(argv=None) -> int:
     args.workdir = (args.workdir or Path(f"/kaggle/working/latcomm-{args.profile}")).resolve()
     if args.restore:
         args.restore = args.restore.resolve()
-    if args.gpus < 0 or args.microbatch < 1 or args.checkpoint_every < 1 or args.session_steps < 0 or args.session_hours < 0:
+    if args.gpus < 0 or args.microbatch < 1 or args.checkpoint_every < 1 or args.session_steps < 0 or args.session_hours < 0 or args.benchmark_microbatches < 0:
         parser.error("GPU count and session limits must be nonnegative; microbatch/checkpoint interval must be positive.")
     repo, commit = checkout(args)
     script = repo / "kaggle/run.py"

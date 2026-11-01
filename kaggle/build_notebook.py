@@ -1,5 +1,6 @@
 """Build the lightweight Kaggle bootstrap notebook and source bundle."""
 from pathlib import Path
+from copy import deepcopy
 import json
 import zipfile
 
@@ -42,6 +43,7 @@ ACTION = "all"                         # setup, prepare, stage1, encode, stage2,
 NUM_GPUS = 0                           # 0 = all visible GPUs
 SESSION_STEPS = 25                     # new updates per session, full schedule is retained
 SESSION_HOURS = 8.0                    # graceful stop at the next optimizer boundary
+BENCHMARK_MICROBATCHES = 0              # 3 = time only 3 microbatches; use a fresh WORKDIR
 RESTORE = None                        # e.g. /kaggle/input/previous-output/latcomm-full
 DATA_SOURCE = None                    # optional local copy of published data
 DATA_DIR = f"/kaggle/temp/latcomm-data-{PROFILE}"
@@ -79,6 +81,7 @@ PyTorch закреплён на **2.11.0 cu126** для T4/P100; Transformers �
            "--workdir", WORKDIR, "--profile", PROFILE, "--pair", PAIR,
            "--action", ACTION, "--gpus", str(NUM_GPUS),
            "--session-steps", str(SESSION_STEPS), "--session-hours", str(SESSION_HOURS),
+           "--benchmark-microbatches", str(BENCHMARK_MICROBATCHES),
            "--data-dir", DATA_DIR, "--packet-cache", PACKET_CACHE]
 if SOURCE_COMMIT:
     command += ["--commit", SOURCE_COMMIT]
@@ -105,8 +108,11 @@ elif result.returncode:
 Готовый совместимый кэш можно подключить из `/kaggle/input/...` через `PACKET_CACHE`.
 Полный эксперимент требует многих сессий; `SESSION_STEPS` ограничивает текущую сессию.
 """), cell("code", '''import json
+benchmark = Path(WORKDIR) / "outputs/stage1/benchmark.json"
 metrics = Path(WORKDIR) / "results/metrics.json"
-if metrics.exists():
+if benchmark.exists():
+    print(json.dumps(json.loads(benchmark.read_text()), indent=2, ensure_ascii=False))
+elif metrics.exists():
     print(json.dumps(json.loads(metrics.read_text()), indent=2, ensure_ascii=False))
 else:
     print("Оценка ещё не завершена. Checkpoints:", str(Path(WORKDIR) / "outputs"))
@@ -126,7 +132,27 @@ except ImportError:
     pass
 else:
     nbformat.validate(notebook)
+diagnostic = deepcopy(notebook)
+diagnostic["cells"][0]["source"] = [
+    "# LatComm: диагностика скорости\n",
+    "\nСначала отправьте обновлённую папку `kaggle/` в свой форк.\n",
+    "Этот запуск измеряет **3 микробатча** Stage 1 без обновления весов и без начальной оценки на 256 примерах.\n",
+    "Используется отдельный WORKDIR; существующие checkpoints сохраняются.\n",
+    "Вывод показывает rank, фазу encoder/receiver/backward и время каждого микробатча.\n",
+    "Оценка времени полного шага приблизительная; данные и модели всё равно должны быть загружены.\n",
+]
+settings = "".join(diagnostic["cells"][1]["source"])
+settings = settings.replace('WORKDIR = f"/kaggle/working/latcomm-{PROFILE}"',
+                            'WORKDIR = "/kaggle/working/latcomm-benchmark"')
+settings = settings.replace('ACTION = "all"', 'ACTION = "stage1"')
+settings = settings.replace('BENCHMARK_MICROBATCHES = 0', 'BENCHMARK_MICROBATCHES = 3')
+diagnostic["cells"][1]["source"] = settings.splitlines(keepends=True)
+diagnostic_path = ROOT / "LatComm_Diagnostic.ipynb"
+diagnostic_path.write_text(json.dumps(diagnostic, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+for item in diagnostic["cells"]:
+    if item["cell_type"] == "code":
+        compile("".join(item["source"]), "diagnostic-notebook-cell", "exec")
 with zipfile.ZipFile(ROOT / "LatComm_Kaggle.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
-    for name in ("bootstrap.py", "run.py", "data_utils.py", "runtime.py", "README_RU.md", target.name):
+    for name in ("bootstrap.py", "run.py", "data_utils.py", "runtime.py", "README_RU.md", target.name, diagnostic_path.name):
         archive.write(ROOT / name, "kaggle/" + name)
 print(target)

@@ -157,3 +157,20 @@ def test_setup_pins_pascal_compatible_wheels(tmp_path, monkeypatch):
     assert torch_install[-2:] == ["--index-url", "https://download.pytorch.org/whl/cu126"]
     assert "transformers==5.15.1" in all_commands[1]
     assert all_commands[-1] == [run.sys.executable, "-m", "pip", "install", "--no-deps", "-e", tmp_path]
+
+
+def test_benchmark_runs_stage1_only_instead_of_continuing_pipeline(tmp_path, monkeypatch):
+    import data_utils
+
+    monkeypatch.setattr(run, "source_identity", lambda _: {"source_commit": "a" * 40})
+    monkeypatch.setattr(run, "manifest", lambda *_: {"dataset_revision": "data-sha"})
+    monkeypatch.setattr(data_utils, "prepare_data", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(run, "hardware", lambda _: (2, "fp16", []))
+    monkeypatch.setattr(run, "configure", lambda *_: {})
+    launch = Mock(return_value=0)
+    monkeypatch.setattr(run, "launch", launch)
+    monkeypatch.setenv("LATCOMM_INDEX_DIR", str(tmp_path / "indexes"))
+    assert run.main(["all", "--workdir", str(tmp_path / "benchmark"), "--benchmark-microbatches", "3"]) == 0
+    assert launch.call_count == 1
+    assert launch.call_args.args[5] == "stage1"
+    assert launch.call_args.args[0].benchmark_microbatches == 3
