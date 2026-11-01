@@ -48,6 +48,17 @@ pip install pytest
 pytest
 ```
 
+## Kaggle (this fork)
+
+Import [`kaggle/LatComm_Kaggle.ipynb`](kaggle/LatComm_Kaggle.ipynb) into Kaggle and enable
+Internet and a GPU accelerator. The notebook clones
+[`SalavatFayzullin/LatComm`](https://github.com/SalavatFayzullin/LatComm), installs the
+pinned environment, and runs `kaggle/run.py` from that checkout. Commit and push the
+`kaggle/` directory to the selected branch before using it. Checkpoints record the
+source commit so later sessions can restore the same code.
+
+See [`kaggle/README_RU.md`](kaggle/README_RU.md) for data, hardware, and resume settings.
+
 ## Data
 
 The data is on the Hugging Face Hub:
