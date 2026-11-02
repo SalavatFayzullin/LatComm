@@ -50,6 +50,10 @@ FORMAT_VERSION = 1
 LOSS_NORMALIZER = 32768.0
 SESSION_LIMIT_EXIT = 75
 SHARD_ROWS = 64
+BEST_POLICY = {
+    "metric": "loss", "mode": "min", "comparison": "strictly_lower",
+    "ties": "keep_existing", "stage1_step_zero": False, "stage2_step_zero": True,
+}
 
 
 def memory_snapshot() -> dict[str, float]:
@@ -414,14 +418,112 @@ def save_training_checkpoint(output, name, model, config, optimizer, scheduler, 
     return destination
 
 
+def read_best_checkpoint(output: Path, fingerprint: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Validate a persisted selection without rebinding it to another experiment."""
+    pointer = output / "best.json"
+    if not pointer.exists():
+        return None
+    best = read_json(pointer)
+    if (best.get("format") != FORMAT_VERSION or best.get("policy") != BEST_POLICY
+            or best.get("fingerprint_sha256") != canonical_hash(fingerprint)
+            or best.get("provenance") != fingerprint):
+        raise ValueError("Best checkpoint rejected: source, data, settings or selection policy changed")
+    step = best.get("step")
+    value = best.get("value")
+    if (type(step) is not int or step < 0 or not isinstance(value, (int, float))
+            or not math.isfinite(value)):
+        raise ValueError("Best checkpoint has invalid validation loss or step")
+    relative = f"checkpoints/best-step-{step:08d}"
+    root = (output / "checkpoints").resolve()
+    checkpoint = (output / relative).resolve()
+    if best.get("path") != relative or checkpoint.parent != root:
+        raise ValueError("Best checkpoint path escaped output/checkpoints")
+    metadata = read_json(checkpoint / "runtime.json")
+    info = read_json(checkpoint / "checkpoint.json")
+    if (metadata.get("kind") != "validation_best_bridge" or metadata.get("resumable") is not False
+            or metadata.get("complete") is not False or metadata.get("selection") != best
+            or info.get("step") != step or info.get("config") != best.get("config")
+            or (checkpoint / "training_state.pt").exists()
+            or file_hash(checkpoint / "bridge.safetensors") != best.get("bridge_sha256")):
+        raise ValueError("Best checkpoint metadata or bridge checksum changed")
+    return best
+
+
+def save_best_checkpoint(output, model, config, fingerprint, progress, metrics):
+    """Publish bridge-only validation minima; never change exact-resume state.
+
+    Step zero participates only in Stage 2. Non-finite losses are not candidates;
+    equal losses retain the already selected checkpoint. Publication precedes
+    retention so a crash always leaves the previous or the new selection usable.
+    Called on the main rank inside the evaluation RNG-preservation block.
+    """
+    best = read_best_checkpoint(output, fingerprint)
+    step, loss = progress["step"], float(metrics["loss"])
+    if (not math.isfinite(loss) or (step == 0 and config.training.trainable == "all")
+            or (best is not None and loss >= best["value"])):
+        return best
+    name = f"best-step-{step:08d}"
+    root = (output / "checkpoints").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    destination = root / name
+    temporary = root / f".{name}.incomplete-{os.getpid()}"
+    for path in (destination, temporary):
+        if path.resolve().parent != root:
+            raise ValueError("Best checkpoint staging path escaped output/checkpoints")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    save_bridge(temporary, model.bridge, config, step)
+    selected = {
+        "format": FORMAT_VERSION, "policy": dict(BEST_POLICY),
+        "metric": "loss", "value": loss, "step": step,
+        "path": f"checkpoints/{name}", "fingerprint_sha256": canonical_hash(fingerprint),
+        "bridge_sha256": file_hash(temporary / "bridge.safetensors"),
+        "config": config.model_dump(mode="json"), "provenance": fingerprint,
+    }
+    metadata = {"kind": "validation_best_bridge", "resumable": False, "complete": False,
+                "progress": dict(progress), "fingerprint_sha256": canonical_hash(fingerprint),
+                "selection": selected}
+    atomic_json(temporary / "runtime.json", metadata)
+    if destination.exists():
+        # An interruption may have published the bridge before best.json. Reuse
+        # only the identical candidate, never overwrite an immutable directory.
+        existing = read_json(destination / "runtime.json")
+        if (existing != metadata
+                or file_hash(destination / "bridge.safetensors") != selected["bridge_sha256"]):
+            raise ValueError(f"Best checkpoint already exists with different state: {destination}")
+        shutil.rmtree(temporary)
+    else:
+        os.replace(temporary, destination)
+    atomic_json(output / "best.json", selected)
+    for old in root.iterdir():
+        if old.name == name or not re.fullmatch(r"best-step-\d{8}", old.name) or not old.is_dir():
+            continue
+        if old.resolve().parent != root:
+            raise ValueError("Best checkpoint retention path escaped output/checkpoints")
+        old_metadata = old / "runtime.json"
+        if not old_metadata.is_file() or (old / "training_state.pt").exists():
+            continue
+        info = read_json(old_metadata)
+        if (info.get("kind") == "validation_best_bridge" and info.get("resumable") is False
+                and info.get("fingerprint_sha256") == canonical_hash(fingerprint)):
+            shutil.rmtree(old)
+    LOGGER.info("Validation best | step %d | loss=%.4f | bridge: %s", step, loss, destination)
+    return selected
+
+
 def resolve_resume(output: Path, requested: str) -> Path | None:
     if requested == "none":
-        if (output / "latest.json").exists():
+        if (output / "latest.json").exists() or (output / "best.json").exists():
             raise ValueError("Output already contains a run; use --resume auto or choose another output_dir")
         return None
     if requested != "auto":
         path = Path(requested)
-        return resolve_resume(path, "auto") if (path / "latest.json").exists() else path
+        if (path / "latest.json").exists():
+            return resolve_resume(path, "auto")
+        if not (path / "training_state.pt").is_file():
+            raise ValueError("Resume requires an exact training checkpoint with training_state.pt; "
+                             "a validation-best bridge is for evaluation only")
+        return path
     latest = output / "latest.json"
     if not latest.exists():
         return None
@@ -538,8 +640,11 @@ def _train(config, args, distributed) -> int:
     eval_path = Path(config.data.dataset_root) / f"{config.data.eval_split}.jsonl"
     fingerprint = settings_fingerprint(config, args.precision, distributed, args.source_commit,
                                        train_path, eval_path, cache_identity)
+    read_best_checkpoint(output, fingerprint)
     state = None
     if resume is not None:
+        if not (resume / "training_state.pt").is_file():
+            raise ValueError("Resume requires training_state.pt; a validation-best bridge is for evaluation only")
         state = torch.load(resume / "training_state.pt", map_location="cpu", weights_only=False)
         if state["format"] != FORMAT_VERSION or state["fingerprint"] != fingerprint:
             raise ValueError("Resume rejected: data, model, source, precision, world size, or training settings changed")
@@ -647,6 +752,8 @@ def _train(config, args, distributed) -> int:
             metrics, _ = upstream_evaluate(model, ProgressLoader(
                 eval_loader, f"{stage} | validation batches on worker 0", enabled=distributed.is_main), distributed)
             log("eval", metrics)
+            if distributed.is_main:
+                save_best_checkpoint(output, model, config, fingerprint, dict(progress), metrics)
         finally:
             restore_rng(previous_rng)
 

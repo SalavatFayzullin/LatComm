@@ -187,6 +187,70 @@ def runtime_command(processes: int, command: list):
     return [sys.executable, str(HERE / "runtime.py"), *command]
 
 
+def training_source(args, repo: Path, state) -> Path:
+    """Reuse the original clean checkout or clone its saved SHA separately."""
+    from bootstrap import canonical_url, checkout, git
+    from types import SimpleNamespace
+
+    if canonical_url(state["source_url"]) != canonical_url(source_identity(repo)["source_url"]):
+        raise ValueError("Audit run belongs to a different fork")
+    if args.training_repo:
+        candidate = args.training_repo.resolve()
+        if (candidate / ".git").exists():
+            if (git(candidate, "rev-parse", "HEAD") == state["source_commit"]
+                    and canonical_url(git(candidate, "remote", "get-url", "origin")) == canonical_url(state["source_url"])
+                    and not git(candidate, "status", "--porcelain", "--untracked-files=no")):
+                return candidate
+        print("Original checkout is unavailable or changed; loading its pinned source in the controls workdir.", flush=True)
+    options = SimpleNamespace(repo_dir=args.workdir / "training-source", workdir=args.workdir / "source-pin",
+                              repo_url=state["source_url"], ref="main", commit=state["source_commit"], restore=None)
+    original, _ = checkout(options)
+    return original
+
+
+def audit_run(args, repo: Path) -> int:
+    """Evaluate existing artifacts; never call training or rewrite its manifest."""
+    if args.audit_run is None:
+        raise ValueError("audit requires --audit-run pointing at a completed training workdir")
+    original = args.audit_run.resolve()
+    if args.workdir == original or original in args.workdir.parents:
+        raise ValueError("Controls workdir must be outside the completed training run")
+    state = json.loads((original / "manifest.json").read_text(encoding="utf-8"))
+    checkpoint = original / "outputs/stage2/checkpoints/final"
+    runtime_meta = json.loads((checkpoint / "runtime.json").read_text(encoding="utf-8"))
+    if not runtime_meta.get("complete"):
+        raise ValueError("Finish Stage 2 before running its control evaluations")
+    environment_info = json.loads((original / "outputs/stage2/environment.json").read_text(encoding="utf-8"))
+    precision = environment_info["precision"]
+    if args.precision not in ("auto", precision):
+        raise ValueError("Control evaluations must use the training run's backbone precision")
+    args.profile = state["profile"]
+    args.precision = precision
+    processes, _, _ = hardware(args)
+    pinned_repo = training_source(args, repo, state)
+    data_dir = (args.data_dir or Path(f"/kaggle/temp/latcomm-data-{state['profile']}")).resolve()
+    if not (data_dir / "stage2/test.jsonl").is_file():
+        raise FileNotFoundError(f"Original prepared test data is missing: {data_dir / 'stage2/test.jsonl'}. "
+                                "Use the same session's DATA_DIR or an intact saved copy of that exact test split.")
+    packet_cache = (args.packet_cache or original / "packets").resolve()
+    output = (args.audit_output or args.workdir / "audit-results").resolve()
+    for protected in (original, packet_cache, data_dir, pinned_repo):
+        if output == protected or protected in output.parents:
+            raise ValueError("Audit output must be outside the training artifacts, data and source")
+    source = source_identity(repo)
+    command = ["--run-dir", str(original), "--training-repo", str(pinned_repo),
+               "--data-dir", str(data_dir), "--packet-cache", str(packet_cache), "--output", str(output)]
+    if args.verbose:
+        command += ["--verbose"]
+    if processes > 1:
+        launch_command = [sys.executable, "-m", "torch.distributed.run", "--standalone",
+                          "--nproc_per_node", str(processes), str(HERE / "audit.py"), *command]
+    else:
+        launch_command = [sys.executable, str(HERE / "audit.py"), *command]
+    print("Controls: actual packet, shuffled packet, query only, full context. Training artifacts are read-only.", flush=True)
+    return subprocess.run(launch_command, env=environment(repo, source["source_commit"])).returncode
+
+
 def launch(args, repo, configs, processes, precision, stage, source_commit):
     if stage in ("stage1", "stage2"):
         # Even completed stages go through runtime fingerprint validation. Merely
@@ -222,7 +286,7 @@ def launch(args, repo, configs, processes, precision, stage, source_commit):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("action", choices=("setup", "prepare", "stage1", "encode", "stage2", "evaluate", "all"))
+    p.add_argument("action", choices=("setup", "prepare", "stage1", "encode", "stage2", "evaluate", "all", "audit"))
     p.add_argument("--workdir", type=Path)
     p.add_argument("--data-dir", type=Path, help="Prepared JSONL data directory (stage1/ and stage2/).")
     p.add_argument("--data-source", type=Path, help="Local copy of the HF repository or prepared data; avoids download.")
@@ -240,6 +304,9 @@ def main(argv=None):
     p.add_argument("--benchmark-microbatches", type=int, default=0,
                    help="Time N Stage 1 microbatches without optimizer updates; use a fresh workdir")
     p.add_argument("--verbose", action="store_true", help="Show detailed per-worker training logs")
+    p.add_argument("--audit-run", type=Path, help="Completed training run for evaluation-only controls")
+    p.add_argument("--training-repo", type=Path, help="Optional original source checkout of that run")
+    p.add_argument("--audit-output", type=Path, help="New result directory for the control evaluations")
     args = p.parse_args(argv)
     if args.pair is None:
         args.pair = PAIRS[1] if args.profile == "kaggle" else PAIRS[0]
@@ -247,14 +314,20 @@ def main(argv=None):
         p.error("microbatch/checkpoint interval must be positive; session limits cannot be negative")
     if args.benchmark_microbatches and args.action not in ("all", "stage1"):
         p.error("--benchmark-microbatches is supported with all or stage1 only")
-    args.workdir = (args.workdir or Path(f"/kaggle/working/latcomm-{args.profile}")).resolve()
+    default_workdir = "/kaggle/working/latcomm-controls" if args.action == "audit" else f"/kaggle/working/latcomm-{args.profile}"
+    args.workdir = (args.workdir or Path(default_workdir)).resolve()
+    repo = repository()
+    if args.action == "audit":
+        if args.restore is not None or args.benchmark_microbatches:
+            p.error("audit uses --audit-run directly, without --restore or training benchmark")
+        args.workdir.mkdir(parents=True, exist_ok=True)
+        return audit_run(args, repo)
     args.data_dir = (args.data_dir or args.workdir / "data").resolve()
     args.packet_cache = (args.packet_cache or args.workdir / "packets").resolve()
     args.workdir.mkdir(parents=True, exist_ok=True)
     os.environ["LATCOMM_INDEX_DIR"] = str(args.workdir / "indexes")
     if args.restore:
         restore(args.restore.resolve(), args.workdir)
-    repo = repository()
     if args.action == "setup":
         install(repo)
         return 0

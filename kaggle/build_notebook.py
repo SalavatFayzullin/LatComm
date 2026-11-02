@@ -134,7 +134,83 @@ elif metrics.exists():
     print(json.dumps(json.loads(metrics.read_text()), indent=2, ensure_ascii=False))
 else:
     print("Оценка ещё не завершена. Checkpoints:", str(Path(WORKDIR) / "outputs"))
-'''), cell("markdown", (ROOT / "README_RU.md").read_text(encoding="utf-8"))]
+''')]
+
+cells.append(cell("markdown", """## Контрольные оценки уже обученного интерфейса
+
+Эта проверка использует готовый запуск. Повторного обучения нет.
+Для текущей сессии оставьте `TRAINED_RUN`, `TRAINING_REPO` и `PREPARED_DATA`
+как указано ниже. Измените `RUN_CONTROLS` на `True` и выполните **только следующую ячейку**.
+Она самостоятельна: ячейки обучения повторно запускать не требуется.
+
+На тех же тестовых вопросах будут сравнены:
+обученный интерфейс с правильным пакетом; пакет другого контекста;
+получатель без интерфейса и контекста; получатель с полным текстом контекста.
+Во всех вариантах сохраняются вопросы, варианты и правило выбора ответа.
+Подробные примеры CLOTH также сохраняются для проверки формата и ошибок.
+
+Новый код проверок загружается в отдельный checkout. Исходный код обучения берётся
+из SHA сохранённого запуска; модель, пакеты и прежние результаты не перезаписываются.
+Результаты появятся в `CONTROLS_WORKDIR/audit-results`.
+"""))
+controls_code = '''from pathlib import Path
+import os
+import subprocess
+import sys
+import json
+
+RUN_CONTROLS = False
+TRAINED_RUN = "/kaggle/working/latcomm-kaggle"
+TRAINING_REPO = "/kaggle/working/LatComm"
+PREPARED_DATA = "/kaggle/temp/latcomm-data-kaggle"
+CONTROLS_WORKDIR = "/kaggle/working/latcomm-controls"
+CONTROLS_REPO = "/kaggle/working/LatComm-controls"
+CONTROLS_REF = "main"
+CONTROLS_GPUS = 0                    # all visible GPUs
+CONTROLS_SKIP_SETUP = True           # current session already has the training environment
+
+if RUN_CONTROLS:
+    os.environ.setdefault("HF_HOME", "/kaggle/temp/latcomm-hf")
+    controls_bootstrap = Path("/kaggle/working/latcomm_controls_bootstrap.py")
+    controls_bootstrap.write_text(BOOTSTRAP_SOURCE_PLACEHOLDER, encoding="utf-8")
+    command = [sys.executable, str(controls_bootstrap),
+               "--repo-url", "https://github.com/SalavatFayzullin/LatComm.git",
+               "--ref", CONTROLS_REF, "--repo-dir", CONTROLS_REPO,
+               "--action", "audit", "--workdir", CONTROLS_WORKDIR,
+               "--audit-run", TRAINED_RUN, "--training-repo", TRAINING_REPO,
+               "--data-dir", PREPARED_DATA, "--packet-cache", str(Path(TRAINED_RUN) / "packets"),
+               "--gpus", str(CONTROLS_GPUS)]
+    if CONTROLS_SKIP_SETUP:
+        command += ["--skip-setup"]
+    subprocess.run(command, check=True)
+    summary_file = Path(CONTROLS_WORKDIR) / "audit-results/audit_summary.json"
+    summary = json.loads(summary_file.read_text(encoding="utf-8"))
+    names = {"actual_packet": "Правильный пакет", "shuffled_packet": "Чужой пакет",
+             "query_only": "Без контекста", "raw_text": "Полный текст"}
+    print(f"Сравнение на {summary['examples']} одинаковых вопросах")
+    print(f"{'Режим':20} {'Верно':>8} {'Accuracy':>10} {'Loss':>10}")
+    for mode, metrics in summary["modes"].items():
+        correct = round(metrics["accuracy"] * summary["examples"])
+        print(f"{names[mode]:20} {correct:>8} {metrics['accuracy']:>9.2%} {metrics['loss']:>10.4f}")
+    print("Ожидаемая accuracy равномерного случайного выбора:", f"{summary['chance_accuracy']['overall']:.2%}")
+    print("Воспроизведение прежнего результата:", summary.get("reproduction_check", {}).get("status", "не проверено"))
+    print("\\nТочность по задачам:")
+    modes = list(summary["modes"])
+    print(f"{'Задача':15}" + "".join(f"{names[mode]:>19}" for mode in modes))
+    for task in sorted(summary["chance_accuracy"]["per_task"]):
+        print(f"{task:15}" + "".join(f"{summary['modes'][mode]['accuracy/' + task]:>18.1%}" for mode in modes))
+    print("\\nПодробные результаты:", summary_file.parent)
+    print("Примеры CLOTH:", summary_file.parent / "cloth_examples.jsonl")
+else:
+    print("Для оценки готового интерфейса задайте RUN_CONTROLS = True.")
+'''.replace("BOOTSTRAP_SOURCE_PLACEHOLDER", repr(bootstrap))
+cells.append(cell("code", controls_code))
+controls_target = ROOT / "Run_LatComm_Controls.py"
+controls_target.write_text(
+    "# Paste this complete file into a NEW cell in the existing Kaggle notebook.\n"
+    "# The trained run, models and prepared test data must still be available.\n"
+    + controls_code.replace("RUN_CONTROLS = False", "RUN_CONTROLS = True", 1), encoding="utf-8")
+cells.append(cell("markdown", (ROOT / "README_RU.md").read_text(encoding="utf-8")))
 
 notebook = {"cells": cells, "metadata": {
     "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
@@ -151,7 +227,7 @@ except ImportError:
 else:
     nbformat.validate(notebook)
 with zipfile.ZipFile(ROOT / "LatComm_Kaggle.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
-    for name in ("bootstrap.py", "run.py", "data_utils.py", "runtime.py", "progress.py", "README_RU.md", target.name):
+    for name in ("bootstrap.py", "run.py", "data_utils.py", "runtime.py", "progress.py", "audit.py", "README_RU.md", controls_target.name, target.name):
         archive.write(ROOT / name, "kaggle/" + name)
     archive.write(ROOT.parent / "latcomm/evaluate.py", "latcomm/evaluate.py")
 print(target)

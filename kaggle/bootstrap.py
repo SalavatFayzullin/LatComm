@@ -104,6 +104,10 @@ def training_arguments(args):
         value = getattr(args, name)
         if value is not None:
             command += ["--" + name.replace("_", "-"), str(value)]
+    for name in ("audit_run", "training_repo", "audit_output"):
+        value = getattr(args, name, None)
+        if value is not None:
+            command += ["--" + name.replace("_", "-"), str(value)]
     if args.benchmark_microbatches:
         command += ["--benchmark-microbatches", str(args.benchmark_microbatches)]
     if getattr(args, "verbose", False):
@@ -116,11 +120,11 @@ def main(argv=None) -> int:
     parser.add_argument("--repo-url", default=REPO_URL)
     parser.add_argument("--ref", default="main", help="Branch/tag used for a new experiment.")
     parser.add_argument("--commit", help="Optional full SHA; saved runs automatically pin their original SHA.")
-    parser.add_argument("--repo-dir", type=Path, default=Path("/kaggle/working/LatComm"))
+    parser.add_argument("--repo-dir", type=Path)
     parser.add_argument("--workdir", type=Path)
     parser.add_argument("--profile", choices=("kaggle", "full", "smoke"), default="kaggle")
     parser.add_argument("--pair", help="Omit to use the profile's model pair")
-    parser.add_argument("--action", choices=("setup", "prepare", "stage1", "encode", "stage2", "evaluate", "all"), default="all")
+    parser.add_argument("--action", choices=("setup", "prepare", "stage1", "encode", "stage2", "evaluate", "all", "audit"), default="all")
     parser.add_argument("--gpus", type=int, default=0)
     parser.add_argument("--microbatch", type=int, default=1)
     parser.add_argument("--precision", choices=("auto", "fp16", "bf16"), default="auto")
@@ -135,13 +139,28 @@ def main(argv=None) -> int:
     parser.add_argument("--data-revision")
     parser.add_argument("--skip-setup", action="store_true", help="Reuse an environment already installed in this session.")
     parser.add_argument("--verbose", action="store_true", help="Show detailed per-worker training logs")
+    parser.add_argument("--audit-run", type=Path, help="Completed training workdir to evaluate without training")
+    parser.add_argument("--training-repo", type=Path, help="Optional unchanged source checkout of the completed run")
+    parser.add_argument("--audit-output", type=Path, help="New directory for control evaluation results")
     args = parser.parse_args(argv)
-    args.workdir = (args.workdir or Path(f"/kaggle/working/latcomm-{args.profile}")).resolve()
+    default_workdir = "/kaggle/working/latcomm-controls" if args.action == "audit" else f"/kaggle/working/latcomm-{args.profile}"
+    args.workdir = (args.workdir or Path(default_workdir)).resolve()
+    default_repo = "/kaggle/working/LatComm-controls" if args.action == "audit" else "/kaggle/working/LatComm"
+    args.repo_dir = (args.repo_dir or Path(default_repo)).resolve()
     if args.restore:
         args.restore = args.restore.resolve()
     if args.gpus < 0 or args.microbatch < 1 or args.checkpoint_every < 1 or args.session_steps < 0 or args.session_hours < 0 or args.benchmark_microbatches < 0:
         parser.error("GPU count and session limits must be nonnegative; microbatch/checkpoint interval must be positive.")
+    if args.action == "audit" and (args.audit_run is None or args.restore is not None):
+        parser.error("audit requires --audit-run; use the completed run directly instead of --restore")
+    if args.action == "audit":
+        if args.workdir == args.audit_run.resolve() or args.audit_run.resolve() in args.workdir.parents:
+            parser.error("Choose a separate --workdir for the control results")
+        if args.training_repo and args.repo_dir == args.training_repo.resolve():
+            parser.error("Choose a separate --repo-dir for the audit tools; preserve the training checkout")
     repo, commit = checkout(args)
+    if args.action == "audit" and not (repo / "kaggle/audit.py").is_file():
+        raise RuntimeError(f"Fork revision {commit} has no control evaluator; commit and push kaggle/audit.py first")
     script = repo / "kaggle/run.py"
     env = dict(os.environ)
     env["LATCOMM_SOURCE_COMMIT"] = commit
