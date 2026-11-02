@@ -53,6 +53,7 @@ NUM_GPUS = 0                           # 0 = all visible GPUs
 SESSION_STEPS = 0                      # 0: finish training; optional per-session update cap
 SESSION_HOURS = 0.0                    # 0: no extra script time limit; Kaggle limits still apply
 BENCHMARK_MICROBATCHES = 0              # 3 = time only 3 microbatches; use a fresh WORKDIR
+VERBOSE = False                       # True: detailed per-worker diagnostics
 RESTORE = None                        # e.g. /kaggle/input/previous-output/latcomm-kaggle
 DATA_SOURCE = None                    # optional local copy of published data
 DATA_DIR = f"/kaggle/temp/latcomm-data-{PROFILE}"
@@ -105,6 +106,8 @@ if DATA_SOURCE:
     command += ["--data-source", DATA_SOURCE]
 if SKIP_SETUP:
     command += ["--skip-setup"]
+if VERBOSE:
+    command += ["--verbose"]
 result = subprocess.run(command)
 if result.returncode == 75:
     print("Сессия завершена штатно; сохраните Output и продолжите с RESTORE.")
@@ -148,7 +151,7 @@ except ImportError:
 else:
     nbformat.validate(notebook)
 with zipfile.ZipFile(ROOT / "LatComm_Kaggle.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
-    for name in ("bootstrap.py", "run.py", "data_utils.py", "runtime.py", "README_RU.md", target.name):
+    for name in ("bootstrap.py", "run.py", "data_utils.py", "runtime.py", "progress.py", "README_RU.md", target.name):
         archive.write(ROOT / name, "kaggle/" + name)
     archive.write(ROOT.parent / "latcomm/evaluate.py", "latcomm/evaluate.py")
 print(target)

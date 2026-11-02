@@ -156,7 +156,8 @@ def test_setup_pins_pascal_compatible_wheels(tmp_path, monkeypatch):
     assert "torchaudio==2.11.0" in torch_install
     assert torch_install[-2:] == ["--index-url", "https://download.pytorch.org/whl/cu126"]
     assert "transformers==5.15.1" in all_commands[1]
-    assert all_commands[-1] == [run.sys.executable, "-m", "pip", "install", "--no-deps", "-e", tmp_path]
+    assert all_commands[-1] == [run.sys.executable, "-m", "pip", "install", "--quiet",
+                                "--disable-pip-version-check", "--no-deps", "-e", tmp_path]
 
 
 def test_benchmark_runs_stage1_only_instead_of_continuing_pipeline(tmp_path, monkeypatch):

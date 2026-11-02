@@ -49,19 +49,22 @@ def arguments(tmp_path, remote, **extra):
                            commit=None, workdir=tmp_path / "work", restore=None, **extra)
 
 
-def test_clone_installs_and_runs_file_from_fork(remote, tmp_path, monkeypatch):
+@pytest.mark.parametrize("verbose", [False, True])
+def test_clone_installs_and_runs_file_from_fork(remote, tmp_path, monkeypatch, verbose):
     log = tmp_path / "calls.jsonl"
     monkeypatch.setenv("BOOTSTRAP_LOG", str(log))
     monkeypatch.setenv("BOOTSTRAP_CODE", "75")
     repo = tmp_path / "clone"
-    status = bootstrap.main(["--repo-url", str(remote), "--repo-dir", str(repo),
-                             "--workdir", str(tmp_path / "work"), "--profile", "smoke", "--gpus", "2"])
+    command = ["--repo-url", str(remote), "--repo-dir", str(repo),
+               "--workdir", str(tmp_path / "work"), "--profile", "smoke", "--gpus", "2"]
+    status = bootstrap.main(command + (["--verbose"] if verbose else []))
     assert status == 75
     records = [json.loads(line) for line in log.read_text().splitlines()]
     assert [r["args"][0] for r in records] == ["setup", "all"]
     assert all(Path(r["file"]).resolve() == repo / "kaggle/run.py" for r in records)
     assert all(r["commit"] == git(remote, "rev-parse", "HEAD") for r in records)
     assert "--profile" in records[1]["args"] and "smoke" in records[1]["args"]
+    assert ("--verbose" in records[1]["args"]) == verbose
     assert not (tmp_path / "work/upstream").exists()
 
 

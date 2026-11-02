@@ -14,7 +14,7 @@ import subprocess
 import sys
 
 REPO_URL = "https://github.com/SalavatFayzullin/LatComm.git"
-REQUIRED = ("kaggle/run.py", "kaggle/runtime.py", "kaggle/data_utils.py", "latcomm/model.py")
+REQUIRED = ("kaggle/run.py", "kaggle/runtime.py", "kaggle/data_utils.py", "kaggle/progress.py", "latcomm/model.py")
 
 
 def call(command, **kwargs):
@@ -106,6 +106,8 @@ def training_arguments(args):
             command += ["--" + name.replace("_", "-"), str(value)]
     if args.benchmark_microbatches:
         command += ["--benchmark-microbatches", str(args.benchmark_microbatches)]
+    if getattr(args, "verbose", False):
+        command += ["--verbose"]
     return command
 
 
@@ -132,6 +134,7 @@ def main(argv=None) -> int:
     parser.add_argument("--packet-cache", type=Path)
     parser.add_argument("--data-revision")
     parser.add_argument("--skip-setup", action="store_true", help="Reuse an environment already installed in this session.")
+    parser.add_argument("--verbose", action="store_true", help="Show detailed per-worker training logs")
     args = parser.parse_args(argv)
     args.workdir = (args.workdir or Path(f"/kaggle/working/latcomm-{args.profile}")).resolve()
     if args.restore:

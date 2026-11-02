@@ -35,6 +35,7 @@ if os.environ.get("LATCOMM_REPO"):
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from data_utils import IndexedExamples
+from progress import CounterProgress, ProgressLoader, TrainingProgress, configure_logging, format_metrics
 from latcomm.checkpoint import load_bridge, save_bridge
 from latcomm.config import LatCommConfig, load_config
 from latcomm.data import Collator, LengthSortedBatchSampler, ShuffleSampler, pad, tokenize
@@ -82,9 +83,10 @@ def memory_snapshot() -> dict[str, float]:
 class MicrobatchProgress:
     """Report completed work without CUDA synchronization or RNG changes."""
 
-    def __init__(self, rank: int, *, interval: float = 30.0):
+    def __init__(self, rank: int, *, interval: float = 30.0, summary=None):
         self.rank = rank
         self.interval = interval
+        self.summary = summary
         self.completed = 0
         self.retry = 0
 
@@ -98,9 +100,10 @@ class MicrobatchProgress:
         self.emit("update_start", microbatches=target)
 
     def emit(self, kind: str, **values) -> None:
-        LOGGER.info("%s", json.dumps({"type": kind, "rank": self.rank,
-                                      "next_step": self.next_step, "mode": self.mode,
-                                      "retry": self.retry, **memory_snapshot(), **values}))
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug("%s", json.dumps({"type": kind, "rank": self.rank,
+                                          "next_step": self.next_step, "mode": self.mode,
+                                          "retry": self.retry, **memory_snapshot(), **values}))
 
     def phase(self, name: str) -> None:
         if self.completed == 0:
@@ -118,13 +121,16 @@ class MicrobatchProgress:
                       microbatch_seconds=round(now - self.batch_started, 3),
                       elapsed_seconds=round(elapsed, 3))
             self.last_report = now
+        if self.summary:
+            self.summary.microbatch(self.next_step, self.completed, self.target, now - self.started)
 
     def repeat(self, attempt: int, old_scale: float, new_scale: float) -> None:
         self.retry = attempt
-        LOGGER.warning("%s", json.dumps({"type": "fp16_retry", "rank": self.rank,
-                       "next_step": self.next_step, "attempt": attempt,
-                       "microbatches_to_repeat": self.target,
-                       "old_loss_scale": old_scale, "new_loss_scale": new_scale}))
+        if self.rank == 0:
+            LOGGER.warning("Step %d: FP16 overflow; retry %d of the same %d microbatches, loss scale %g -> %g",
+                           self.next_step, attempt, self.target, old_scale, new_scale)
+        self.emit("fp16_retry", attempt=attempt, microbatches_to_repeat=self.target,
+                  old_loss_scale=old_scale, new_loss_scale=new_scale)
         self.completed = 0
 
 
@@ -186,7 +192,7 @@ def enable_fp16_stability(precision: str) -> None:
 
     stable_l2norm._latcomm_fp32 = True
     modeling_qwen3_5.l2norm = stable_l2norm
-    LOGGER.info("FP16 stability: Qwen3.5 fallback Q/K L2 normalization computes in FP32")
+    LOGGER.debug("FP16 stability: Qwen3.5 fallback Q/K L2 normalization computes in FP32")
 
 
 def build_runtime_model(config, precision: str, device, **kwargs):
@@ -202,6 +208,7 @@ def code_identity(source_commit: str) -> dict[str, Any]:
     helper = Path(__file__).with_name("data_utils.py")
     if helper.exists():
         files["kaggle/data_utils.py"] = file_hash(helper)
+    files["kaggle/progress.py"] = file_hash(Path(__file__).with_name("progress.py"))
     libraries = {name: version(name) for name in ("torch", "transformers", "numpy", "pydantic", "safetensors")}
     libraries["python"] = sys.version.split()[0]
     return {"source_commit": source_commit or os.environ.get("LATCOMM_SOURCE_COMMIT", ""),
@@ -507,6 +514,7 @@ def train(args) -> int:
 
 def _train(config, args, distributed) -> int:
     output = Path(config.training.output_dir)
+    stage = "Stage 1" if config.training.trainable == "all" else "Stage 2"
     if distributed.is_main:
         output.mkdir(parents=True, exist_ok=True)
         (output / "session-paused.json").unlink(missing_ok=True)
@@ -536,13 +544,16 @@ def _train(config, args, distributed) -> int:
         if state["format"] != FORMAT_VERSION or state["fingerprint"] != fingerprint:
             raise ValueError("Resume rejected: data, model, source, precision, world size, or training settings changed")
         if state.get("complete"):
-            LOGGER.info("Run already completed at %s", resume)
+            if distributed.is_main:
+                LOGGER.info("%s already completed: %s", stage, resume)
             return 0
 
-    LOGGER.info("rank %d: loading models; memory=%s", distributed.rank, json.dumps(memory_snapshot()))
+    if distributed.is_main:
+        LOGGER.info("%s | loading frozen models...", stage)
     model = build_runtime_model(config, args.precision, distributed.device,
                                 load_encoder=config.data.packet_cache is None)
-    LOGGER.info("rank %d: models loaded; memory=%s", distributed.rank, json.dumps(memory_snapshot()))
+    if LOGGER.isEnabledFor(logging.DEBUG):
+        LOGGER.debug("rank %d: models loaded; memory=%s", distributed.rank, json.dumps(memory_snapshot()))
     if config.training.init_checkpoint:
         load_bridge(config.training.init_checkpoint, model.bridge)
     if cache_identity is not None:
@@ -566,7 +577,8 @@ def _train(config, args, distributed) -> int:
     packets = PacketCache(config.data.packet_cache) if config.data.packet_cache else None
     collator = Collator(load_tokenizer(config.encoder), load_tokenizer(config.receiver), config.data,
                         with_context=packets is None, packets=packets)
-    LOGGER.info("rank %d: opening/indexing train and eval data", distributed.rank)
+    if distributed.is_main:
+        LOGGER.info("%s | preparing data indices...", stage)
     train_examples = IndexedExamples(train_path, config.data)
     eval_examples = IndexedExamples(eval_path, config.data)
     if not len(train_examples) or len(eval_examples) < distributed.world_size:
@@ -578,10 +590,10 @@ def _train(config, args, distributed) -> int:
     total_steps = config.training.max_steps or config.training.num_epochs * steps_per_epoch
     if total_steps <= 0:
         raise ValueError("Training schedule is empty")
-    LOGGER.info("%s", json.dumps({"type": "training_plan", "rank": distributed.rank,
-                "examples": len(train_examples), "epochs": config.training.num_epochs,
-                "global_batch": config.training.per_device_batch_size * accumulation * distributed.world_size,
-                "accumulation": accumulation, "total_steps": total_steps}))
+    if distributed.is_main:
+        LOGGER.info("%s | %s examples | %d epochs | %d updates | global batch %d",
+                    stage, f"{len(train_examples):,}", config.training.num_epochs, total_steps,
+                    config.training.per_device_batch_size * accumulation * distributed.world_size)
     optimizer = torch.optim.AdamW(parameters, lr=config.training.learning_rate,
                                   weight_decay=config.training.weight_decay)
     scheduler = build_scheduler(optimizer, config, total_steps)
@@ -599,8 +611,8 @@ def _train(config, args, distributed) -> int:
         if len(state["rng"]) != distributed.world_size:
             raise ValueError("Resume checkpoint is missing a rank's RNG state")
         restore_rng(state["rng"][distributed.rank])
-        LOGGER.info("Resumed optimizer step %d, epoch %d, next batch %d",
-                    progress["step"], progress["epoch"], progress["next_batch"])
+        if distributed.is_main:
+            LOGGER.info("%s | resumed after step %d/%d", stage, progress["step"], total_steps)
     elif distributed.is_main:
         atomic_json(output / "config.json", config.model_dump(mode="json"))
         atomic_json(output / "environment.json", {
@@ -612,30 +624,42 @@ def _train(config, args, distributed) -> int:
     stats = dict.fromkeys(("nll", "tokens", "correct_tokens", "examples", "correct", "gate"), 0.0)
     if state is not None:
         stats = state["statistics"][distributed.rank]
+    summary = TrainingProgress(stage, total_steps, config.training.num_epochs, steps_per_epoch,
+                               enabled=distributed.is_main, memory=memory_snapshot)
 
     def log(kind, metrics):
         if distributed.is_main:
             record = {"type": kind, "step": progress["step"], **metrics}
             with (output / "metrics.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record) + "\n")
-            LOGGER.info("%s", json.dumps(record, sort_keys=True))
+            LOGGER.debug("%s", json.dumps(record, sort_keys=True))
+            if kind == "eval":
+                LOGGER.info("%s | validation at step %d/%d | %s", stage, progress["step"],
+                            total_steps, format_metrics(metrics))
 
     def evaluate_now():
         # Evaluation is deterministic and must not perturb continuation RNG.
         previous_rng = rng_state()
-        LOGGER.info("rank %d: evaluation starting at optimizer step %d", distributed.rank, progress["step"])
+        if distributed.is_main:
+            LOGGER.info("%s | validating at step %d/%d (%d examples)...", stage, progress["step"],
+                        total_steps, len(eval_examples))
         try:
-            metrics, _ = upstream_evaluate(model, eval_loader, distributed)
+            metrics, _ = upstream_evaluate(model, ProgressLoader(
+                eval_loader, f"{stage} | validation batches on worker 0", enabled=distributed.is_main), distributed)
             log("eval", metrics)
         finally:
             restore_rng(previous_rng)
 
     def save(complete=False):
         name = "final" if complete else f"step-{progress['step']:08d}"
-        LOGGER.info("rank %d: saving checkpoint %s", distributed.rank, name)
+        LOGGER.debug("rank %d: saving checkpoint %s", distributed.rank, name)
+        if complete and distributed.is_main:
+            LOGGER.info("%s | saving final checkpoint...", stage)
         result = save_training_checkpoint(output, name, model, config, optimizer, scheduler, scaler,
                                          distributed, fingerprint, dict(progress), complete=complete, statistics=dict(stats))
-        LOGGER.info("rank %d: checkpoint %s saved", distributed.rank, name)
+        LOGGER.debug("rank %d: checkpoint %s saved", distributed.rank, name)
+        if complete and distributed.is_main:
+            LOGGER.info("%s complete | final checkpoint: %s", stage, result)
         return result
 
     model.train()
@@ -643,6 +667,7 @@ def _train(config, args, distributed) -> int:
     if state is None:
         evaluate_now()
         save()  # A valid resume point exists even before a very long first update.
+    summary.last_report = summary.last_update_report = time.monotonic()
     started = time.monotonic()
     session_steps = 0
     consecutive_overflows = 0
@@ -650,7 +675,7 @@ def _train(config, args, distributed) -> int:
     micro_steps = 0
     buffered_batches = []
     update_rng = update_stats = None
-    reporter = MicrobatchProgress(distributed.rank)
+    reporter = MicrobatchProgress(distributed.rank, summary=summary)
     model._microbatch_progress = reporter
 
     def accumulate(batch):
@@ -672,6 +697,9 @@ def _train(config, args, distributed) -> int:
     while progress["step"] < total_steps:
         epoch = progress["epoch"]
         start_batch = progress["next_batch"]
+        if distributed.is_main:
+            LOGGER.info("%s | epoch %d/%d starting | completed %d/%d updates",
+                        stage, epoch + 1, config.training.num_epochs, progress["step"], total_steps)
         sampler.set_epoch(epoch)
         loader.batch_sampler.start = start_batch
         loader.generator.manual_seed(config.training.seed + epoch * distributed.world_size + distributed.rank)
@@ -731,6 +759,7 @@ def _train(config, args, distributed) -> int:
             session_steps += 1
             micro_steps = update_tokens = 0
             buffered_batches = []
+            latest_metrics = None
             if progress["step"] % config.training.log_every == 0:
                 shards = distributed.all_gather(stats)
                 merged = {key: sum(shard[key] for shard in shards) for key in stats}
@@ -743,8 +772,13 @@ def _train(config, args, distributed) -> int:
                 if config.data.response_format == "mcq":
                     metrics["accuracy"] = merged["correct"] / merged["examples"]
                 log("train", metrics)
+                latest_metrics = metrics
                 stats = dict.fromkeys(stats, 0.0)
             complete = progress["step"] == total_steps
+            summary.update(progress["step"], time.monotonic() - reporter.started, latest_metrics,
+                           force=end_epoch or complete)
+            if end_epoch and distributed.is_main:
+                LOGGER.info("%s | epoch %d/%d complete", stage, epoch + 1, config.training.num_epochs)
             if progress["step"] % config.training.eval_every == 0 or end_epoch or complete:
                 evaluate_now()
             if complete:
@@ -764,7 +798,9 @@ def _train(config, args, distributed) -> int:
                         "reason": "session_limit",
                     })
                 distributed.barrier()
-                LOGGER.info("Session limit reached; resume with --resume auto (exit 75)")
+                if distributed.is_main:
+                    LOGGER.info("%s paused at step %d/%d; checkpoint saved, resume with --resume auto (exit 75)",
+                                stage, progress["step"], total_steps)
                 return SESSION_LIMIT_EXIT
         # A finished data pass must advance the epoch cursor.
         if progress["epoch"] == epoch:
@@ -814,7 +850,8 @@ def _encode(config, args, distributed) -> int:
         # Attached Kaggle datasets are read-only. A completed compatible cache
         # needs checksum verification only, with no model load or file writes.
         packet_fingerprint(output)
-        LOGGER.info("Reusing complete, verified packet cache: %s", output)
+        if distributed.is_main:
+            LOGGER.info("Packets | reusing complete, verified cache: %s", output)
         return 0
     manifest_path = output / f"encoding-rank{distributed.rank}.json"
     index_path = output / f"index-rank{distributed.rank}.json"
@@ -837,6 +874,9 @@ def _encode(config, args, distributed) -> int:
         raise ValueError("Existing packet index contains contexts absent from the current data")
     existing = sum(distributed.all_gather(len(index)))
     remaining = len(unique) - existing
+    if distributed.is_main:
+        LOGGER.info("Packets | %s unique contexts, %s already saved | loading encoder...",
+                    f"{len(unique):,}", f"{existing:,}")
     payload_bytes = remaining * math.prod(packet_shape) * 2
     headroom = max(256 * 1024**2, math.ceil(payload_bytes * 0.05))
     free_bytes = shutil.disk_usage(output).free
@@ -858,6 +898,7 @@ def _encode(config, args, distributed) -> int:
                                 "provenance": provenance, "contexts": 0, "complete": False})
     distributed.barrier()
     tokenizer = load_tokenizer(config.encoder)
+    encoding_progress = CounterProgress("Packets saved", len(unique), initial=existing, enabled=distributed.is_main)
     pending_keys: list[str] = []
     pending_packets: list[np.ndarray] = []
     next_shard = 0
@@ -903,6 +944,15 @@ def _encode(config, args, distributed) -> int:
         keys, contexts = [], []
         if len(pending_keys) >= SHARD_ROWS:
             flush()
+        if encoding_progress.due():
+            # Read only published indices. No extra distributed collective is
+            # needed, and another worker may have unfinished packets in memory.
+            saved = len(index)
+            for rank in range(distributed.world_size):
+                other = output / f"index-rank{rank}.json"
+                if rank != distributed.rank and other.exists():
+                    saved += len(read_json(other))
+            encoding_progress.update(saved)
 
     try:
         for key, (dataset_index, row) in unique.items():
@@ -920,6 +970,8 @@ def _encode(config, args, distributed) -> int:
     if not index_path.exists():
         atomic_json(index_path, index)
         atomic_json(manifest_path, manifest)
+    if distributed.is_main and distributed.world_size > 1:
+        LOGGER.info("Packets | local encoding finished; synchronizing workers...")
     counts = distributed.all_gather({"count": len(index), "shards": manifest["shards"]})
     if distributed.is_main:
         total = sum(item["count"] for item in counts)
@@ -928,7 +980,8 @@ def _encode(config, args, distributed) -> int:
         shards = {name: digest for item in counts for name, digest in item["shards"].items()}
         atomic_json(meta_path, {"dtype": "bfloat16", "packet_shape": list(model.bridge.packet_shape),
                                 "provenance": provenance, "contexts": total, "shards": shards, "complete": True})
-        LOGGER.info("Encoded cache complete: %d unique contexts", total)
+        encoding_progress.update(total, force=True)
+        LOGGER.info("Packets complete | %s unique contexts | cache: %s", f"{total:,}", output)
     distributed.barrier()
     return 0
 
@@ -937,6 +990,8 @@ def evaluate_command(args) -> int:
     config = load_config(args.config)
     distributed = initialize_distributed()
     try:
+        if distributed.is_main:
+            LOGGER.info("Test | loading final model and packet cache...")
         packets = None
         identity = None
         if config.data.packet_cache:
@@ -964,7 +1019,10 @@ def evaluate_command(args) -> int:
             "per_device_eval_batch_size": 1,
         })})
         loader, _ = make_loader(examples, collator, eval_config, distributed, training=False)
-        metrics, records = upstream_evaluate(model, loader, distributed, packet_dtype="bfloat16")
+        if distributed.is_main:
+            LOGGER.info("Test | evaluating %s examples...", f"{len(examples):,}")
+        metrics, records = upstream_evaluate(model, ProgressLoader(
+            loader, "Test batches on worker 0", enabled=distributed.is_main), distributed, packet_dtype="bfloat16")
         if distributed.is_main:
             output = Path(args.output)
             output.mkdir(parents=True, exist_ok=True)
@@ -979,6 +1037,7 @@ def evaluate_command(args) -> int:
                 for record in records:
                     handle.write(json.dumps(record) + "\n")
             os.replace(temporary, output / "predictions.jsonl")
+            LOGGER.info("Test complete | %s | results: %s", format_metrics(metrics), output)
         distributed.barrier()
         return 0
     finally:
@@ -993,6 +1052,7 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--config", required=True)
         command.add_argument("--precision", required=True, choices=("fp16", "bf16"))
         command.add_argument("--source-commit", default=os.environ.get("LATCOMM_SOURCE_COMMIT", ""))
+        command.add_argument("--verbose", action="store_true", help="Show per-worker debug events and detailed metrics")
         if name != "train":
             command.add_argument("--checkpoint", required=True)
             command.add_argument("--output", required=True)
@@ -1012,8 +1072,8 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     args = parser().parse_args(argv)
+    configure_logging(args.verbose)
     if args.command == "train":
         if args.session_steps < 0 or args.session_hours < 0 or args.checkpoint_every < 1 or args.benchmark_microbatches < 0:
             raise ValueError("Session limits must be nonnegative and checkpoint interval positive")

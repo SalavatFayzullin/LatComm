@@ -57,11 +57,13 @@ def install(repo: Path):
     # CUDA wheels may drop these architectures. Do not replace this with -U torch.
     call([sys.executable, "-m", "pip", "install", "--upgrade",
           "torch==2.11.0", "torchvision==0.26.0", "torchaudio==2.11.0",
+          "--quiet", "--disable-pip-version-check",
           "--index-url", "https://download.pytorch.org/whl/cu126"])
     call([sys.executable, "-m", "pip", "install",
           "transformers==5.15.1", "pydantic>=2.10,<3", "safetensors>=0.5",
-          "numpy<3", "PyYAML>=6", "huggingface_hub>=0.34", "sentencepiece", "accelerate>=1.0"])
-    call([sys.executable, "-m", "pip", "install", "--no-deps", "-e", repo])
+          "numpy<3", "PyYAML>=6", "huggingface_hub>=0.34", "sentencepiece", "accelerate>=1.0",
+          "--quiet", "--disable-pip-version-check"])
+    call([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--no-deps", "-e", repo])
 
 
 def hardware(args):
@@ -87,9 +89,9 @@ def hardware(args):
     precision = ("bf16" if bf16 else "fp16") if args.precision == "auto" else args.precision
     if precision == "bf16" and not bf16:
         raise RuntimeError("Native BF16 needs an Ampere-or-newer GPU. Use --precision fp16 on T4/P100.")
-    print(json.dumps({"devices": devices, "precision": precision,
-                      "global_batch": batch, "microbatch": args.microbatch,
-                      "accumulation": batch // (processes * args.microbatch)}, indent=2), flush=True)
+    print(f"Hardware: {processes} GPU ({', '.join(d['name'] for d in devices)}) | {precision.upper()} | "
+          f"global batch {batch} | microbatch {args.microbatch} | "
+          f"accumulation {batch // (processes * args.microbatch)}", flush=True)
     if precision == "fp16":
         print("Numerical deviation from the paper: frozen LLMs FP16, interface/AdamW FP32, "
               "dynamic loss scaling. Stored packets remain BF16. Architecture and objective are unchanged.", flush=True)
@@ -205,6 +207,8 @@ def launch(args, repo, configs, processes, precision, stage, source_commit):
                    "--checkpoint", str(args.workdir / "outputs/stage2/checkpoints/final"),
                    "--data", str(args.data_dir / "stage2/test.jsonl"),
                    "--output", str(args.workdir / "results")]
+    if getattr(args, "verbose", False):
+        command += ["--verbose"]
     # torchrun turns the worker's planned 75 into its own nonzero return code.
     result = subprocess.run(runtime_command(processes, command), env=environment(repo, source_commit))
     if result.returncode and stage in ("stage1", "stage2"):
@@ -235,6 +239,7 @@ def main(argv=None):
     p.add_argument("--checkpoint-every", type=int, default=5)
     p.add_argument("--benchmark-microbatches", type=int, default=0,
                    help="Time N Stage 1 microbatches without optimizer updates; use a fresh workdir")
+    p.add_argument("--verbose", action="store_true", help="Show detailed per-worker training logs")
     args = p.parse_args(argv)
     if args.pair is None:
         args.pair = PAIRS[1] if args.profile == "kaggle" else PAIRS[0]
@@ -269,7 +274,10 @@ def main(argv=None):
                                                 "torch": __import__("torch").__version__})
     stages = (("stage1",) if args.benchmark_microbatches else
               (("stage1", "encode", "stage2", "evaluate") if args.action == "all" else (args.action,)))
-    for stage in stages:
+    names = {"stage1": "Stage 1: context reconstruction", "encode": "Create context packets",
+             "stage2": "Stage 2: question answering", "evaluate": "Final test"}
+    for position, stage in enumerate(stages, 1):
+        print(f"\n[{position}/{len(stages)}] {names[stage]}", flush=True)
         status = launch(args, repo, configs, processes, precision, stage, source["source_commit"])
         if status:
             return status

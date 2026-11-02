@@ -372,7 +372,7 @@ def test_encoding_disk_preflight_runs_before_loading_models(tmp_path, monkeypatc
 def test_progress_reports_microbatches_and_fp16_retries(caplog):
     import logging
     progress = runtime.MicrobatchProgress(1, interval=0.0)
-    with caplog.at_level(logging.INFO, logger=runtime.LOGGER.name):
+    with caplog.at_level(logging.DEBUG, logger=runtime.LOGGER.name):
         progress.start(1, 192)
         progress.phase("backward")
         progress.begin_microbatch()
