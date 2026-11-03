@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import shutil
 import sys
+import time
 
 import numpy as np
 import pytest
@@ -106,8 +107,10 @@ def assert_nested_equal(left, right):
         assert left == right
 
 
-@pytest.mark.parametrize("relocate", [False, True])
-def test_exact_resume_matches_uninterrupted_and_retains_two_checkpoints(tmp_path, relocate):
+@pytest.mark.parametrize("relocate,pause_with_deadline", [(False, False), (True, False), (True, True)])
+def test_exact_resume_matches_uninterrupted_and_retains_two_checkpoints(
+    tmp_path, monkeypatch, relocate, pause_with_deadline,
+):
     data = tmp_path / "data"
     write_data(data)
     full, interrupted = tmp_path / "full", tmp_path / "interrupted"
@@ -115,9 +118,16 @@ def test_exact_resume_matches_uninterrupted_and_retains_two_checkpoints(tmp_path
     save_config(full_config, config_dict(data, full))
     save_config(interrupted_config, config_dict(data, interrupted))
     assert runtime.train(train_args(full_config)) == 0
-    assert runtime.train(train_args(interrupted_config, limit=1)) == 75
+    with monkeypatch.context() as pause:
+        if pause_with_deadline:
+            pause.setenv("LATCOMM_DEADLINE_MONOTONIC", str(time.monotonic() - 1))
+        limit = 0 if pause_with_deadline else 1
+        assert runtime.train(train_args(interrupted_config, limit=limit)) == 75
     assert not (interrupted / "checkpoints" / "final").exists()
-    assert (interrupted / "session-paused.json").exists()
+    marker = json.loads((interrupted / "session-paused.json").read_text(encoding="utf-8"))
+    latest = json.loads((interrupted / "latest.json").read_text(encoding="utf-8"))
+    assert marker["step"] == latest["step"] == 1
+    assert marker["checkpoint"] == latest["path"]
     if relocate:
         new_data, new_output = tmp_path / "attached-data", tmp_path / "next-session"
         shutil.copytree(data, new_data)

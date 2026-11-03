@@ -776,6 +776,7 @@ def _train(config, args, distributed) -> int:
         save()  # A valid resume point exists even before a very long first update.
     summary.last_report = summary.last_update_report = time.monotonic()
     started = time.monotonic()
+    deadline = float(os.environ.get("LATCOMM_DEADLINE_MONOTONIC", "inf"))
     session_steps = 0
     consecutive_overflows = 0
     update_tokens = 0
@@ -892,7 +893,8 @@ def _train(config, args, distributed) -> int:
                 save(complete=True)
                 return 0
             capped = (args.session_steps > 0 and session_steps >= args.session_steps) or (
-                args.session_hours > 0 and time.monotonic() - started >= args.session_hours * 3600)
+                args.session_hours > 0 and time.monotonic() - started >= args.session_hours * 3600) or (
+                time.monotonic() >= deadline)
             capped = distributed.sum(int(capped)) > 0
             if capped or progress["step"] % args.checkpoint_every == 0:
                 save()

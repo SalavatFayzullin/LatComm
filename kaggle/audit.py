@@ -298,6 +298,7 @@ def validate_run(runtime, args, manifest):
     expected_settings["data"].pop("packet_cache")
     if expected_settings != fingerprint["settings"]:
         raise ValueError("Checkpoint config differs from its original training fingerprint")
+    initial_bridge = fingerprint.get("initial_bridge")
     del state
     test = Path(args.data_dir) / "stage2/test.jsonl"
     receipt = read_json(Path(args.data_dir) / "preparation.json")
@@ -333,15 +334,85 @@ def validate_run(runtime, args, manifest):
         "cache_identity_sha256": runtime.canonical_hash(identity),
         "precision": precision, "packet_storage": meta["dtype"],
         "checkpoint_step": info["step"], "checkpoint_selection": "original_final",
+        "checkpoint_stage": "stage2", "initial_bridge_sha256": initial_bridge,
         "training_world_size": environment["world_size"],
         "original_final_test_metrics": read_json(run / "results/metrics.json")
             if (run / "results/metrics.json").exists() else None,
     }
 
 
+def validate_stage1_for_comparison(runtime, args, config, precision, identity, final_provenance):
+    """Select the exact completed bridge that initialized this Stage 2 run.
+
+    Its weights are evaluated with Stage 2 MCQ inputs, not Stage 1's text
+    reconstruction data limits. The existing cache is valid because Stage 2
+    freezes the compressors; both checkpoints must match its compressor hash.
+    """
+    run = Path(args.run_dir)
+    checkpoint = run / "outputs/stage1/checkpoints/final"
+    info = runtime.validate_stage1_checkpoint(checkpoint, config)
+    status = read_json(checkpoint / "runtime.json")
+    environment = read_json(run / "outputs/stage1/environment.json")
+    if (not status.get("complete") or status["progress"]["step"] != info["step"]
+            or info["step"] < 1):
+        raise ValueError("Stage 1 final checkpoint is not complete or its step differs")
+    saved = runtime.LatCommConfig.model_validate(info["config"])
+    if (saved.data.response_format != "text" or saved.data.packet_cache is not None
+            or saved.training.init_checkpoint is not None):
+        raise ValueError("Expected the original Stage 1 text-reconstruction bridge")
+    code = final_provenance["training_code"]
+    if environment["source"] != code:
+        raise ValueError("Stage 1 code or library versions differ from the original run")
+    if (environment["precision"] != precision or status.get("precision") != precision
+            or environment.get("bridge_dtype") != "float32"
+            or environment.get("packet_storage") != "bfloat16"):
+        raise ValueError("Stage 1 precision differs from the original run")
+    if status.get("world_size") != environment.get("world_size"):
+        raise ValueError("Stage 1 training world size differs from its environment")
+    state = runtime.torch.load(checkpoint / "training_state.pt", map_location="cpu", weights_only=False)
+    fingerprint = state["fingerprint"]
+    if (state.get("format") != runtime.FORMAT_VERSION or not state.get("complete")
+            or state["progress"] != status["progress"]
+            or runtime.canonical_hash(fingerprint) != status["fingerprint_sha256"]
+            or fingerprint["code"] != code or fingerprint["precision"] != precision
+            or fingerprint["world_size"] != environment["world_size"]):
+        raise ValueError("Stage 1 training state/provenance differs from the completed run")
+    settings = saved.model_dump(mode="json")
+    settings["training"].pop("output_dir")
+    settings["training"].pop("init_checkpoint")
+    settings["data"].pop("dataset_root")
+    settings["data"].pop("packet_cache")
+    if (settings != fingerprint["settings"] or fingerprint["packets"] is not None
+            or fingerprint["initial_bridge"] is not None):
+        raise ValueError("Stage 1 config differs from its original training fingerprint")
+    receipt = read_json(Path(args.data_dir) / "preparation.json")
+    for kind, split in (("train", saved.data.train_split), ("eval", saved.data.eval_split)):
+        if fingerprint["data"][kind] != receipt["files"][f"stage1/{split}.jsonl"]["sha256"]:
+            raise ValueError("Stage 1 training data differs from the preparation receipt")
+    del state
+    bridge_hash = file_hash(checkpoint / "bridge.safetensors")
+    if bridge_hash != final_provenance["initial_bridge_sha256"]:
+        raise ValueError("Saved Stage 1 bridge differs from the bridge that initialized Stage 2")
+    packet_provenance = identity["meta"]["provenance"]
+    if (info["layer_pairs"] != packet_provenance["layer_pairs"]
+            or runtime.checkpoint_compressor_hash(checkpoint) != packet_provenance["compressor"]):
+        raise ValueError("Stage 1 bridge and cached compressors differ")
+    provenance = dict(final_provenance)
+    provenance.pop("original_final_test_metrics", None)
+    provenance.update(checkpoint_stage="stage1", checkpoint_sha256=bridge_hash,
+        checkpoint_step=info["step"], training_world_size=environment["world_size"],
+        checkpoint_selection="original_stage1_final_used_to_initialize_stage2",
+        evaluation_config_stage="stage2", stage1_training_task="text_reconstruction",
+        stage1_config=saved.model_dump(mode="json"),
+        stage1_fingerprint_sha256=status["fingerprint_sha256"])
+    return checkpoint, provenance
+
+
 def paired_comparison(reference, control):
     if [row["sample_id"] for row in reference] != [row["sample_id"] for row in control]:
         raise ValueError("Paired comparisons require identical sample IDs and order")
+    if any(a.get(key) != b.get(key) for a, b in zip(reference, control) for key in ("gold", "dataset")):
+        raise ValueError("Paired comparisons require identical gold answers and tasks")
     count = len(reference)
     return {"examples": count,
             "accuracy_delta": sum(b["correct"] - a["correct"] for a, b in zip(reference, control)) / count,
@@ -429,7 +500,7 @@ def make_summary(results, examples, scoring, provenance):
             "protocol": {"raw_prompt_wrapper": RAW_CONTEXT_PREFIX, "batch_size": 1,
                 "same_sample_set": True, "truncation": False, "training": False,
                 "gradient_tracking": False, "shuffle": "seeded cycle of unique contexts within each task",
-                "checkpoint_selection": "original_final; no claim about an epoch-2 checkpoint"}}
+                "checkpoint_selection": provenance.get("checkpoint_selection", "original_final")}}
 
 
 def publish_results(output, summary, results, examples, sources, descriptions):
@@ -467,6 +538,66 @@ def publish_results(output, summary, results, examples, sources, descriptions):
     os.rename(staging, output)
 
 
+def make_stage_comparison(stage_results, summaries):
+    """Paired Stage 2 minus Stage 1 changes, including packet sensitivity."""
+    first, final = stage_results["stage1"], stage_results["stage2"]
+    if set(first) != set(final):
+        raise ValueError("Both stages must evaluate the same control modes")
+    comparisons, baseline_checks = {}, {}
+    for mode in first:
+        comparison = paired_comparison(first[mode], final[mode])
+        tasks = sorted({row["dataset"] for row in first[mode]})
+        comparison["per_task"] = {task: paired_comparison(
+            [row for row in first[mode] if row["dataset"] == task],
+            [row for row in final[mode] if row["dataset"] == task]) for task in tasks}
+        comparisons[mode] = comparison
+        if mode in ("query_only", "raw_text"):
+            matches = (comparison["prediction_flips"] == 0 and all(
+                math.isclose(a["nll"], b["nll"], rel_tol=1e-4, abs_tol=1e-5)
+                and a["correct_tokens"] == b["correct_tokens"]
+                for a, b in zip(first[mode], final[mode])))
+            baseline_checks[mode] = {"matches": matches,
+                "max_absolute_nll_delta": max(abs(a["nll"] - b["nll"])
+                    for a, b in zip(first[mode], final[mode])),
+                "prediction_flips": comparison["prediction_flips"]}
+            if not matches:
+                raise ValueError(f"Bridge-free baseline {mode} changed between stages; comparison is invalid")
+    sensitivity = {}
+    if "actual_packet" in first and "shuffled_packet" in first:
+        for stage, results in stage_results.items():
+            sensitivity[stage] = paired_comparison(results["shuffled_packet"], results["actual_packet"])
+            tasks = sorted({row["dataset"] for row in results["actual_packet"]})
+            sensitivity[stage]["per_task"] = {task: paired_comparison(
+                [row for row in results["shuffled_packet"] if row["dataset"] == task],
+                [row for row in results["actual_packet"] if row["dataset"] == task]) for task in tasks}
+    return {"format": 1, "examples": summaries["stage2"]["examples"], "stages": summaries,
+        "comparisons": comparisons, "packet_sensitivity": sensitivity, "baseline_checks": baseline_checks,
+        "provenance": summaries["stage2"]["provenance"],
+        "protocol": {"comparison_direction": "stage2_minus_stage1",
+            "packet_sensitivity_direction": "actual_packet_minus_shuffled_packet",
+            "same_sample_set": True, "same_cached_packets": True, "same_shuffle_donors": True,
+            "evaluation_config_stage": "stage2", "training": False,
+            "stage1_interpretation": "Zero-shot MCQ after text reconstruction; low MCQ accuracy alone "
+                "does not establish poor reconstruction or absence of context information in the packets.",
+            "checkpoint_selection": "original finals; no recovery or selection of an epoch-2 checkpoint"}}
+
+
+def publish_stage_comparison(output, comparison, stage_results, examples, sources, descriptions):
+    """Keep both complete per-stage exports and the comparison in one new directory."""
+    output = check_output(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.incomplete-", dir=output.parent))
+    for stage in ("stage1", "stage2"):
+        publish_results(staging / stage, comparison["stages"][stage], stage_results[stage],
+                        examples, sources, descriptions[stage])
+    (staging / "stage_comparison.json").write_text(
+        json.dumps(comparison, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    check_output(output)
+    if output.exists():
+        output.rmdir()
+    os.rename(staging, output)
+
+
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--run-dir", required=True, type=Path)
@@ -476,6 +607,8 @@ def parser():
     result.add_argument("--output", required=True, type=Path)
     result.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
     result.add_argument("--seed", type=int, default=42)
+    result.add_argument("--compare-stage1", action="store_true",
+                        help="Compare the saved Stage 1 initialization with Stage 2 final on the same MCQ controls")
     result.add_argument("--verbose", action="store_true")
     return result
 
@@ -489,36 +622,60 @@ def main(argv=None):
     distributed = runtime.initialize_distributed()
     try:
         config, checkpoint, test, precision, identity, provenance = validate_run(runtime, args, manifest)
+        checkpoints = {"stage2": (checkpoint, provenance)}
+        if args.compare_stage1:
+            stage1 = validate_stage1_for_comparison(runtime, args, config, precision, identity, provenance)
+            checkpoints = {"stage1": stage1, **checkpoints}
         examples, sources = load_examples(test, data_utils.parse_example, config.data)
         receipt = read_json(args.data_dir / "preparation.json")
         if len(examples) != receipt["files"]["stage2/test.jsonl"]["records"]:
             raise ValueError("Audit test sample count differs from the prepared data receipt")
         LOGGER.info("Audit | verified original run; %d examples; loading frozen receiver only", len(examples))
         model = runtime.build_runtime_model(config, precision, distributed.device, load_encoder=False)
-        runtime.load_bridge(checkpoint, model.bridge)
-        if (list(model.bridge.packet_shape) != identity["meta"]["packet_shape"]
-                or runtime.compressor_hash(model.bridge) != identity["meta"]["provenance"]["compressor"]):
-            raise ValueError("Loaded bridge differs from the original packet cache")
-        results, descriptions = evaluate_controls(runtime, model, examples, runtime.PacketCache(args.packet_cache),
-            config, distributed, modes=tuple(args.modes), seed=args.seed, scoring=scoring)
+        packets = runtime.PacketCache(args.packet_cache)
+        stage_results, summaries, lengths = {}, {}, {}
+        for stage, (selected, selected_provenance) in checkpoints.items():
+            LOGGER.info("Audit | %s final | evaluating %d control modes", stage, len(args.modes))
+            runtime.load_bridge(selected, model.bridge)
+            if (list(model.bridge.packet_shape) != identity["meta"]["packet_shape"]
+                    or runtime.compressor_hash(model.bridge) != identity["meta"]["provenance"]["compressor"]):
+                raise ValueError("Loaded bridge differs from the original packet cache")
+            results, descriptions = evaluate_controls(runtime, model, examples, packets,
+                config, distributed, modes=tuple(args.modes), seed=args.seed, scoring=scoring)
+            stage_results[stage], lengths[stage] = results, descriptions
+            if distributed.is_main:
+                try:
+                    audit_commit = git_head(Path(__file__).resolve().parent.parent)
+                except subprocess.CalledProcessError:
+                    audit_commit = None
+                selected_provenance.update(audit_source_commit=audit_commit, audit_script_sha256=file_hash(__file__),
+                    seed=args.seed, evaluation_world_size=distributed.world_size, evaluation_config_stage="stage2")
+                summary = make_summary(results, examples, scoring, selected_provenance)
+                if stage == "stage2":
+                    summary["reproduction_check"] = reproduction_check(results, args.run_dir, scoring)
+                else:
+                    summary["reproduction_check"] = {"status": "not_applicable",
+                        "reason": "Stage 1 text-reconstruction checkpoint has no original MCQ test reference"}
+                summaries[stage] = summary
+                for mode, metrics in summary["modes"].items():
+                    LOGGER.info("Audit | %s | %s | %s", stage, mode, runtime.format_metrics(metrics))
         if distributed.is_main:
-            try:
-                audit_commit = git_head(Path(__file__).resolve().parent.parent)
-            except subprocess.CalledProcessError:
-                audit_commit = None
-            provenance.update(audit_source_commit=audit_commit, audit_script_sha256=file_hash(__file__),
-                              seed=args.seed, evaluation_world_size=distributed.world_size)
-            summary = make_summary(results, examples, scoring, provenance)
-            summary["reproduction_check"] = reproduction_check(results, args.run_dir, scoring)
-            publish_results(args.output, summary, results, examples, sources, descriptions)
-            reproduction = summary["reproduction_check"]
+            if args.compare_stage1:
+                comparison = make_stage_comparison(stage_results, summaries)
+                publish_stage_comparison(args.output, comparison, stage_results, examples, sources, lengths)
+                for stage, sensitivity in comparison["packet_sensitivity"].items():
+                    LOGGER.info("Audit | %s | correct vs shuffled packet gain: %+.2f pp | prediction flips: %d/%d",
+                        stage, 100 * sensitivity["accuracy_delta"], sensitivity["prediction_flips"], len(examples))
+            else:
+                publish_results(args.output, summaries["stage2"], stage_results["stage2"],
+                                examples, sources, lengths["stage2"])
+            reproduction = summaries["stage2"]["reproduction_check"]
             if reproduction["status"] != "match":
-                LOGGER.warning("Audit | original-final reproduction: %s | differing prediction rows: %s | details in audit_summary.json",
-                               reproduction["status"], reproduction.get("prediction_difference_count"))
+                details = args.output / ("stage2/audit_summary.json" if args.compare_stage1 else "audit_summary.json")
+                LOGGER.warning("Audit | original-final reproduction: %s | differing prediction rows: %s | details: %s",
+                               reproduction["status"], reproduction.get("prediction_difference_count"), details)
             else:
                 LOGGER.info("Audit | original-final reproduction: match (accuracy, loss and per-sample gold/prediction)")
-            for mode, metrics in summary["modes"].items():
-                LOGGER.info("Audit | %s | %s", mode, runtime.format_metrics(metrics))
             LOGGER.info("Audit complete | results: %s", args.output)
         distributed.barrier()
         return 0

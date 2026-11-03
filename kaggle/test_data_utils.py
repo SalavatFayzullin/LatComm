@@ -135,3 +135,33 @@ def test_kaggle_rejects_a_source_missing_tasks(tmp_path, monkeypatch):
     monkeypatch.setitem(data.KAGGLE_POLICY, "stage2_per_dataset", {"train": 1})
     with pytest.raises(ValueError, match="Cannot sample"):
         data.sample_kaggle(io.BytesIO(json.dumps(record(0, mcq=True)).encode() + b"\n"), "stage2", "train")
+
+
+@pytest.mark.parametrize("profile", ["overnight", "nightly"])
+def test_extended_profile_increases_only_reconstruction_training_sample(tmp_path, monkeypatch, profile):
+    monkeypatch.setattr(data, "KAGGLE_POLICY", {
+        "seed": 42,
+        "stage1": {"train": 2, "dev": 2, "fast_dev": 2, "test": 2},
+        "stage2_per_dataset": {"train": 3, "dev": 2, "fast_dev": 2, "test": 2},
+        "stage2_datasets": 1,
+    })
+    monkeypatch.setitem(data.EXTENDED_STAGE1_TRAIN, profile, 5)
+    source = tmp_path / "source"
+    for stage in data.FOLDERS:
+        for split in data.SPLITS:
+            write(source / stage / f"{split}.jsonl",
+                  [record(f"{split}-{i}", mcq=stage == "stage2") for i in range(12)])
+
+    pilot, extended = tmp_path / "pilot", tmp_path / profile
+    pilot_receipt = data.prepare_data(pilot, revision="fixed", profile="kaggle", local_source=source)
+    extended_receipt = data.prepare_data(extended, revision="fixed", profile=profile, local_source=source)
+    assert pilot_receipt["files"]["stage1/train.jsonl"]["records"] == 2
+    assert extended_receipt["files"]["stage1/train.jsonl"]["records"] == 5
+    assert extended_receipt["profile"] == profile
+    assert extended_receipt["sampling"]["stage1"]["train"] == 5
+    for relative in pilot_receipt["files"]:
+        if relative != "stage1/train.jsonl":
+            assert (pilot / relative).read_bytes() == (extended / relative).read_bytes()
+    assert data.prepare_data(extended, revision="fixed", profile=profile) == extended_receipt
+    with pytest.raises(ValueError, match="revision/profile changed"):
+        data.prepare_data(extended, revision="fixed", profile="kaggle")

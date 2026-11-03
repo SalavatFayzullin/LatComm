@@ -108,6 +108,8 @@ def training_arguments(args):
         value = getattr(args, name, None)
         if value is not None:
             command += ["--" + name.replace("_", "-"), str(value)]
+    if getattr(args, "compare_stage1", False):
+        command += ["--compare-stage1"]
     if args.benchmark_microbatches:
         command += ["--benchmark-microbatches", str(args.benchmark_microbatches)]
     if getattr(args, "verbose", False):
@@ -122,7 +124,7 @@ def main(argv=None) -> int:
     parser.add_argument("--commit", help="Optional full SHA; saved runs automatically pin their original SHA.")
     parser.add_argument("--repo-dir", type=Path)
     parser.add_argument("--workdir", type=Path)
-    parser.add_argument("--profile", choices=("kaggle", "full", "smoke"), default="kaggle")
+    parser.add_argument("--profile", choices=("kaggle", "overnight", "full", "smoke"), default="kaggle")
     parser.add_argument("--pair", help="Omit to use the profile's model pair")
     parser.add_argument("--action", choices=("setup", "prepare", "stage1", "encode", "stage2", "evaluate", "all", "audit"), default="all")
     parser.add_argument("--gpus", type=int, default=0)
@@ -142,6 +144,8 @@ def main(argv=None) -> int:
     parser.add_argument("--audit-run", type=Path, help="Completed training workdir to evaluate without training")
     parser.add_argument("--training-repo", type=Path, help="Optional unchanged source checkout of the completed run")
     parser.add_argument("--audit-output", type=Path, help="New directory for control evaluation results")
+    parser.add_argument("--compare-stage1", action="store_true",
+                        help="Compare saved Stage 1 and Stage 2 bridges on identical MCQ controls")
     args = parser.parse_args(argv)
     default_workdir = "/kaggle/working/latcomm-controls" if args.action == "audit" else f"/kaggle/working/latcomm-{args.profile}"
     args.workdir = (args.workdir or Path(default_workdir)).resolve()
@@ -153,6 +157,8 @@ def main(argv=None) -> int:
         parser.error("GPU count and session limits must be nonnegative; microbatch/checkpoint interval must be positive.")
     if args.action == "audit" and (args.audit_run is None or args.restore is not None):
         parser.error("audit requires --audit-run; use the completed run directly instead of --restore")
+    if args.compare_stage1 and args.action != "audit":
+        parser.error("--compare-stage1 requires --action audit")
     if args.action == "audit":
         if args.workdir == args.audit_run.resolve() or args.audit_run.resolve() in args.workdir.parents:
             parser.error("Choose a separate --workdir for the control results")

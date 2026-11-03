@@ -1,4 +1,5 @@
 """Controls must never enter training or change its pinned checkout."""
+import ast
 import importlib.util
 import json
 from pathlib import Path
@@ -102,3 +103,65 @@ def test_controls_reject_precision_change_and_output_inside_trained_run(tmp_path
     args.workdir = args.audit_run / "new-controls"
     with pytest.raises(ValueError, match="outside"):
         run.audit_run(args, HERE.parent)
+
+
+def _execute_generated_cell(source, tmp_path, launch):
+    # Keep the complete generated cell but replace only its OS/process services.
+    tree = ast.parse(source)
+    tree.body = [item for item in tree.body if not isinstance(item, (ast.Import, ast.ImportFrom))]
+    def mapped_path(value):
+        text = str(value)
+        return tmp_path / text.lstrip("/") if text.startswith("/kaggle/") else Path(value)
+    namespace = {"Path": mapped_path, "os": SimpleNamespace(environ={}),
+                 "subprocess": SimpleNamespace(run=launch), "sys": SimpleNamespace(executable="python-test"),
+                 "json": json}
+    exec(compile(tree, "generated-controls-cell", "exec"), namespace)
+    return namespace
+
+
+@pytest.mark.parametrize("compare", [False, True])
+def test_standalone_cells_launch_only_audit_and_report_the_expected_summary(tmp_path, capsys, compare):
+    modes = ("actual_packet", "shuffled_packet", "query_only", "raw_text")
+    stage = {"examples": 16, "modes": {mode: {"accuracy": 0.5, "accuracy/cloth": 0.5, "loss": 2.0}
+                                         for mode in modes},
+             "chance_accuracy": {"overall": 0.25, "per_task": {"cloth": 0.25}},
+             "reproduction_check": {"status": "match"}}
+    if compare:
+        summary = {"format": 1, "examples": 16, "stages": {"stage1": stage, "stage2": stage},
+                   "comparisons": {}, "provenance": {}}
+        name, relative = "Run_LatComm_Stage_Comparison.py", "stage-comparison-results/stage_comparison.json"
+    else:
+        summary, name, relative = stage, "Run_LatComm_Controls.py", "audit-results/audit_summary.json"
+    target = tmp_path / "kaggle/working/latcomm-controls" / relative
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps(summary), encoding="utf-8")
+    original = tmp_path / "kaggle/working/latcomm-kaggle/checkpoint-marker"
+    original.parent.mkdir(parents=True)
+    original.write_bytes(b"saved training artifacts")
+    launch = Mock()
+    namespace = _execute_generated_cell((HERE / name).read_text(encoding="utf-8"), tmp_path, launch)
+    command = launch.call_args.args[0]
+    assert launch.call_args.kwargs == {"check": True}
+    assert command[command.index("--action") + 1] == "audit"
+    assert command[command.index("--audit-run") + 1] == "/kaggle/working/latcomm-kaggle"
+    assert command[command.index("--training-repo") + 1] == "/kaggle/working/LatComm"
+    assert "--skip-setup" in command
+    assert ("--compare-stage1" in command) == compare == namespace["COMPARE_STAGE1"]
+    assert original.read_bytes() == b"saved training artifacts"
+    shown = capsys.readouterr().out
+    assert "16 одинаковых вопросах" in shown and "match" in shown and "Правильный пакет" in shown
+    assert ("Stage 1 acc" in shown) == compare
+    assert ("stage_comparison.json" in shown) == compare
+
+
+def test_notebook_control_cells_are_independent_and_disabled_by_default(tmp_path, capsys):
+    notebook = json.loads((HERE / "LatComm_Kaggle.ipynb").read_text(encoding="utf-8"))
+    sources = ["".join(item["source"]) for item in notebook["cells"] if item["cell_type"] == "code"]
+    for flag in ("RUN_CONTROLS", "RUN_STAGE_COMPARISON"):
+        selected = [source for source in sources if f"{flag} = False\n" in source]
+        assert len(selected) == 1
+        launch = Mock(side_effect=AssertionError("disabled cell launched a process"))
+        namespace = _execute_generated_cell(selected[0], tmp_path, launch)
+        assert not namespace[flag]
+        launch.assert_not_called()
+    assert not list(tmp_path.iterdir())

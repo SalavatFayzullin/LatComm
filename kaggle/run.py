@@ -13,13 +13,15 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 PAIRS = ("qwen4b_to_qwen0.8b", "qwen0.8b_to_qwen0.8b")
+REDUCED_PROFILES = ("kaggle", "overnight", "nightly")
 HERE = Path(__file__).resolve().parent
 
 
 def global_batch_size(profile: str) -> int:
-    return 32 if profile == "kaggle" else 384
+    return 32 if profile in REDUCED_PROFILES else 384
 
 
 def call(command, **kwargs):
@@ -153,10 +155,10 @@ def configure(args, repo: Path, state, data, processes: int):
             # This is a distinct, explicitly labelled experiment, not paper results.
             # Keep the two training stages, schedule shape and global batch 384.
             config["training"]["warmup_steps"] = 0
-        elif args.profile == "kaggle":
+        elif args.profile in REDUCED_PROFILES:
             from data_utils import kaggle_count
             examples = data.get("files", {}).get(f"{stage}/train.jsonl", {}).get(
-                "records", kaggle_count(stage, "train"))
+                "records", kaggle_count(stage, "train", profile=args.profile))
             updates = (examples + batch - 1) // batch * config["training"]["num_epochs"]
             original_updates = 5209 if stage == "stage1" else 2208
             config["training"]["warmup_steps"] = max(
@@ -233,13 +235,17 @@ def audit_run(args, repo: Path) -> int:
         raise FileNotFoundError(f"Original prepared test data is missing: {data_dir / 'stage2/test.jsonl'}. "
                                 "Use the same session's DATA_DIR or an intact saved copy of that exact test split.")
     packet_cache = (args.packet_cache or original / "packets").resolve()
-    output = (args.audit_output or args.workdir / "audit-results").resolve()
+    comparing = getattr(args, "compare_stage1", False)
+    default_output = "stage-comparison-results" if comparing else "audit-results"
+    output = (args.audit_output or args.workdir / default_output).resolve()
     for protected in (original, packet_cache, data_dir, pinned_repo):
         if output == protected or protected in output.parents:
             raise ValueError("Audit output must be outside the training artifacts, data and source")
     source = source_identity(repo)
     command = ["--run-dir", str(original), "--training-repo", str(pinned_repo),
                "--data-dir", str(data_dir), "--packet-cache", str(packet_cache), "--output", str(output)]
+    if comparing:
+        command += ["--compare-stage1"]
     if args.verbose:
         command += ["--verbose"]
     if processes > 1:
@@ -248,6 +254,8 @@ def audit_run(args, repo: Path) -> int:
     else:
         launch_command = [sys.executable, str(HERE / "audit.py"), *command]
     print("Controls: actual packet, shuffled packet, query only, full context. Training artifacts are read-only.", flush=True)
+    if comparing:
+        print("Compare saved Stage 1 and Stage 2 bridges on the same questions and packets.", flush=True)
     return subprocess.run(launch_command, env=environment(repo, source["source_commit"])).returncode
 
 
@@ -292,8 +300,8 @@ def main(argv=None):
     p.add_argument("--data-source", type=Path, help="Local copy of the HF repository or prepared data; avoids download.")
     p.add_argument("--packet-cache", type=Path, help="Can point at a persisted /kaggle/input packet directory.")
     p.add_argument("--restore", type=Path, help="Previous saved workdir; restore outputs/manifest, do not copy packet shards.")
-    p.add_argument("--pair", choices=PAIRS, help="Default: 0.8B -> 0.8B for kaggle, 4B -> 0.8B otherwise")
-    p.add_argument("--profile", choices=("kaggle", "full", "smoke"), default="kaggle")
+    p.add_argument("--pair", choices=PAIRS, help="Default: 0.8B -> 0.8B for reduced profiles, 4B -> 0.8B otherwise")
+    p.add_argument("--profile", choices=(*REDUCED_PROFILES, "full", "smoke"), default="kaggle")
     p.add_argument("--data-revision", help="Optional HF commit; resolved and pinned on first run.")
     p.add_argument("--precision", choices=("auto", "fp16", "bf16"), default="auto")
     p.add_argument("--gpus", type=int, default=0, help="0: all visible GPUs; 1 or 2: explicit count.")
@@ -307,13 +315,17 @@ def main(argv=None):
     p.add_argument("--audit-run", type=Path, help="Completed training run for evaluation-only controls")
     p.add_argument("--training-repo", type=Path, help="Optional original source checkout of that run")
     p.add_argument("--audit-output", type=Path, help="New result directory for the control evaluations")
+    p.add_argument("--compare-stage1", action="store_true",
+                   help="Compare saved Stage 1 and Stage 2 bridges on identical MCQ controls")
     args = p.parse_args(argv)
     if args.pair is None:
-        args.pair = PAIRS[1] if args.profile == "kaggle" else PAIRS[0]
+        args.pair = PAIRS[1] if args.profile in REDUCED_PROFILES else PAIRS[0]
     if args.microbatch < 1 or args.checkpoint_every < 1 or args.session_steps < 0 or args.session_hours < 0 or args.benchmark_microbatches < 0:
         p.error("microbatch/checkpoint interval must be positive; session limits cannot be negative")
     if args.benchmark_microbatches and args.action not in ("all", "stage1"):
         p.error("--benchmark-microbatches is supported with all or stage1 only")
+    if args.compare_stage1 and args.action != "audit":
+        p.error("--compare-stage1 requires the audit action")
     default_workdir = "/kaggle/working/latcomm-controls" if args.action == "audit" else f"/kaggle/working/latcomm-{args.profile}"
     args.workdir = (args.workdir or Path(default_workdir)).resolve()
     repo = repository()
@@ -327,7 +339,10 @@ def main(argv=None):
     args.workdir.mkdir(parents=True, exist_ok=True)
     os.environ["LATCOMM_INDEX_DIR"] = str(args.workdir / "indexes")
     if args.restore:
-        restore(args.restore.resolve(), args.workdir)
+        if args.profile == "overnight" and args.data_dir == args.workdir / "data":
+            restore(args.restore.resolve(), args.workdir, include_data=True)
+        else:
+            restore(args.restore.resolve(), args.workdir)
     if args.action == "setup":
         install(repo)
         return 0
@@ -349,7 +364,11 @@ def main(argv=None):
               (("stage1", "encode", "stage2", "evaluate") if args.action == "all" else (args.action,)))
     names = {"stage1": "Stage 1: context reconstruction", "encode": "Create context packets",
              "stage2": "Stage 2: question answering", "evaluate": "Final test"}
+    deadline = float(os.environ.get("LATCOMM_DEADLINE_MONOTONIC", "inf"))
     for position, stage in enumerate(stages, 1):
+        if time.monotonic() >= deadline:
+            print(f"Notebook time budget reached before {names[stage]}.", flush=True)
+            return 75
         print(f"\n[{position}/{len(stages)}] {names[stage]}", flush=True)
         status = launch(args, repo, configs, processes, precision, stage, source["source_commit"])
         if status:
@@ -357,11 +376,14 @@ def main(argv=None):
     return 0
 
 
-def restore(source: Path, destination: Path):
+def restore(source: Path, destination: Path, *, include_data: bool = False):
     """Copy only relatively small training state, leaving large data/cache in Input."""
     if source == destination or not (source / "manifest.json").is_file():
         raise ValueError("--restore must name a different saved latcomm workdir containing manifest.json")
-    for name in ("manifest.json", "outputs"):
+    names = ["manifest.json", "outputs"]
+    if include_data and (source / "data/preparation.json").is_file():
+        names.append("data")
+    for name in names:
         src, dst = source / name, destination / name
         if not src.exists() or dst.exists():
             continue

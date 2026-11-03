@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -177,11 +178,14 @@ def test_benchmark_runs_stage1_only_instead_of_continuing_pipeline(tmp_path, mon
     assert launch.call_args.args[0].benchmark_microbatches == 3
 
 
-def test_kaggle_profile_changes_budget_but_keeps_method(tmp_path):
-    args = options(tmp_path, profile="kaggle", pair="qwen0.8b_to_qwen0.8b")
+@pytest.mark.parametrize("profile,stage1_examples,stage1_updates,stage1_warmup", [
+    ("kaggle", 2048, 64, 2), ("overnight", 45_056, 1408, 42), ("nightly", 28_672, 896, 27),
+])
+def test_kaggle_profile_changes_budget_but_keeps_method(tmp_path, profile, stage1_examples, stage1_updates, stage1_warmup):
+    args = options(tmp_path, profile=profile, pair="qwen0.8b_to_qwen0.8b")
     state = {"models": {side: {"revision": "pinned"} for side in ("encoder", "receiver")}}
     paths = run.configure(args, REPO, state, {}, 2)
-    expected = {"stage1": (2048, 1, 64, 2, "all", "constant"),
+    expected = {"stage1": (stage1_examples, 1, stage1_updates, stage1_warmup, "all", "constant"),
                 "stage2": (1536, 3, 144, 3, "readers_and_gates", "cosine")}
     for stage, (examples, epochs, updates, warmup, trainable, scheduler) in expected.items():
         config = yaml.safe_load(paths[stage].read_text())
@@ -198,6 +202,8 @@ def test_kaggle_profile_changes_budget_but_keeps_method(tmp_path):
 
 
 @pytest.mark.parametrize("profile,pair", [("kaggle", "qwen0.8b_to_qwen0.8b"),
+                                         ("overnight", "qwen0.8b_to_qwen0.8b"),
+                                         ("nightly", "qwen0.8b_to_qwen0.8b"),
                                          ("full", "qwen4b_to_qwen0.8b"),
                                          ("smoke", "qwen4b_to_qwen0.8b")])
 def test_profile_defaults_are_explicit_and_have_no_extra_stop_caps(tmp_path, monkeypatch, profile, pair):
@@ -213,3 +219,73 @@ def test_profile_defaults_are_explicit_and_have_no_extra_stop_caps(tmp_path, mon
     assert run.main(["prepare", "--profile", profile, "--workdir", str(tmp_path / "run")]) == 0
     assert captured[0].pair == pair
     assert captured[0].session_steps == captured[0].session_hours == 0
+
+
+def test_notebook_deadline_prevents_next_stage_after_stage1(tmp_path, monkeypatch):
+    import data_utils
+
+    monkeypatch.setattr(run, "source_identity", lambda _: {"source_commit": "a" * 40})
+    monkeypatch.setattr(run, "manifest", lambda *_: {"dataset_revision": "data-sha"})
+    monkeypatch.setattr(data_utils, "prepare_data", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(run, "hardware", lambda _: (2, "fp16", []))
+    monkeypatch.setattr(run, "configure", lambda *_: {})
+    launch = Mock(return_value=0)
+    monkeypatch.setattr(run, "launch", launch)
+    monkeypatch.setattr(run, "time", SimpleNamespace(monotonic=Mock(side_effect=[10.0, 20.0])))
+    monkeypatch.setenv("LATCOMM_DEADLINE_MONOTONIC", "15.0")
+    monkeypatch.setenv("LATCOMM_INDEX_DIR", str(tmp_path / "indexes"))
+
+    assert run.main(["all", "--profile", "nightly", "--workdir", str(tmp_path / "run")]) == 75
+    assert launch.call_count == 1
+    assert launch.call_args.args[5] == "stage1"
+
+
+@pytest.mark.parametrize("compare,explicit", [(False, False), (True, False), (True, True)])
+def test_audit_comparison_launch_preserves_original_artifacts_and_output(tmp_path, monkeypatch, compare, explicit):
+    original = tmp_path / "finished"
+    stage = original / "outputs/stage2"
+    (stage / "checkpoints/final").mkdir(parents=True)
+    (original / "manifest.json").write_text(json.dumps({"profile": "kaggle"}), encoding="utf-8")
+    (stage / "environment.json").write_text(json.dumps({"precision": "fp16"}), encoding="utf-8")
+    (stage / "checkpoints/final/runtime.json").write_text(json.dumps({"complete": True}), encoding="utf-8")
+    data = tmp_path / "data"
+    (data / "stage2").mkdir(parents=True)
+    (data / "stage2/test.jsonl").write_text("{}\n", encoding="utf-8")
+    tools = tmp_path / "controls"
+    # Previously published controls must survive the new comparison.
+    old_results = tools / "audit-results"
+    old_results.mkdir(parents=True)
+    (old_results / "keep").write_text("old controls", encoding="utf-8")
+    source = tmp_path / "original-source"
+    monkeypatch.setattr(run, "hardware", lambda _: (2, "fp16", []))
+    monkeypatch.setattr(run, "training_source", lambda *_: source)
+    monkeypatch.setattr(run, "source_identity", lambda _: {"source_commit": "a" * 40})
+    forbidden = lambda *_args, **_kwargs: pytest.fail("entered the training pipeline")
+    for name in ("manifest", "configure", "launch", "install", "restore"):
+        monkeypatch.setattr(run, name, forbidden)
+    launch = Mock(return_value=SimpleNamespace(returncode=0))
+    monkeypatch.setattr(run.subprocess, "run", launch)
+    before = {path: path.read_bytes() for path in original.rglob("*") if path.is_file()}
+    command = ["audit", "--audit-run", str(original), "--workdir", str(tools), "--data-dir", str(data)]
+    if compare:
+        command += ["--compare-stage1"]
+    custom = tmp_path / "custom-output"
+    if explicit:
+        command += ["--audit-output", str(custom)]
+    assert run.main(command) == 0
+    forwarded = launch.call_args.args[0]
+    assert ("--compare-stage1" in forwarded) == compare
+    expected = custom if explicit else tools / ("stage-comparison-results" if compare else "audit-results")
+    assert forwarded[forwarded.index("--output") + 1] == str(expected)
+    assert forwarded[forwarded.index("--training-repo") + 1] == str(source)
+    assert before == {path: path.read_bytes() for path in before}
+    assert (old_results / "keep").read_text() == "old controls"
+    assert not (tools / "manifest.json").exists()
+
+
+def test_stage_comparison_rejects_training_actions_before_setup(tmp_path, monkeypatch):
+    monkeypatch.setattr(run, "repository", lambda *_: pytest.fail("initialized before invalid flag check"))
+    with pytest.raises(SystemExit) as caught:
+        run.main(["all", "--compare-stage1", "--workdir", str(tmp_path / "work")])
+    assert caught.value.code == 2
+    assert not (tmp_path / "work").exists()

@@ -347,3 +347,163 @@ def test_existing_output_is_rejected_before_importing_training_code(tmp_path, mo
         audit.main(["--run-dir", str(tmp_path / "old"), "--data-dir", str(tmp_path / "data"),
             "--packet-cache", str(tmp_path / "packets"), "--training-repo", str(tmp_path / "source"),
             "--output", str(output)])
+
+
+@pytest.fixture
+def stage_comparison_artifacts(artifacts, setup):
+    args, manifest, final = artifacts
+    config, model, _, _, _ = setup
+    first = args.run_dir / "outputs/stage1/checkpoints/final"
+    first_config = config.model_copy(deep=True)
+    first_config.training.trainable = "all"
+    first_config.data.response_format = "text"
+    first_config.data.max_context_length = 1152
+    first_config.data.max_prompt_length = 128
+    first_bridge = deepcopy(model.bridge)
+    with torch.no_grad():
+        for reader in first_bridge.readers:
+            reader.output_projection.weight.mul_(-2)
+    save_bridge(first, first_bridge, first_config, 64)
+    code = runtime.code_identity(manifest["source_commit"])
+    receipt = audit.read_json(args.data_dir / "preparation.json")
+    receipt["files"].update({"stage1/train.jsonl": {"sha256": "original-train"},
+                             "stage1/fast_dev.jsonl": {"sha256": "original-eval"}})
+    write_json(args.data_dir / "preparation.json", receipt)
+    settings = first_config.model_dump(mode="json")
+    settings["training"].pop("output_dir")
+    settings["training"].pop("init_checkpoint")
+    settings["data"].pop("dataset_root")
+    settings["data"].pop("packet_cache")
+    fingerprint = {"code": code, "precision": "fp16", "world_size": 2, "settings": settings,
+        "packets": None, "initial_bridge": None, "data": {"train": "original-train", "eval": "original-eval"}}
+    progress = {"step": 64, "epoch": 1, "next_batch": 0, "overflow_retries": 0}
+    torch.save({"format": 1, "complete": True, "progress": progress, "fingerprint": fingerprint},
+               first / "training_state.pt")
+    write_json(first / "runtime.json", {"complete": True, "progress": progress,
+        "fingerprint_sha256": runtime.canonical_hash(fingerprint), "precision": "fp16", "world_size": 2})
+    write_json(args.run_dir / "outputs/stage1/environment.json", {"precision": "fp16", "source": code,
+        "bridge_dtype": "float32", "packet_storage": "bfloat16", "world_size": 2})
+    state = torch.load(final / "training_state.pt", weights_only=False)
+    state["fingerprint"]["initial_bridge"] = audit.file_hash(first / "bridge.safetensors")
+    torch.save(state, final / "training_state.pt")
+    status = audit.read_json(final / "runtime.json")
+    status["fingerprint_sha256"] = runtime.canonical_hash(state["fingerprint"])
+    write_json(final / "runtime.json", status)
+    return args, manifest, first, final
+
+
+def test_stage1_selection_checks_full_initial_bridge_and_allows_original_data_limits(stage_comparison_artifacts):
+    args, manifest, first, _ = stage_comparison_artifacts
+    config, _, _, precision, identity, provenance = audit.validate_run(runtime, args, manifest)
+    selected, selected_provenance = audit.validate_stage1_for_comparison(
+        runtime, args, config, precision, identity, provenance)
+    assert selected == first
+    assert selected_provenance["checkpoint_sha256"] == provenance["initial_bridge_sha256"]
+    assert selected_provenance["checkpoint_stage"] == "stage1"
+    assert selected_provenance["evaluation_config_stage"] == "stage2"
+    assert selected_provenance["stage1_config"]["data"]["max_context_length"] == 1152
+    assert config.data.max_context_length == identity["meta"]["provenance"]["max_context_length"] == 32768
+    assert "original_final_test_metrics" not in selected_provenance
+
+
+@pytest.mark.parametrize("change,match", [
+    ("initial_bridge", "initialized Stage 2"), ("compressor", "cached compressors"),
+    ("code", "code or library"), ("precision", "Stage 1 precision"),
+    ("incomplete", "paused|not complete"), ("architecture", "bridge settings"),
+    ("state", "training state/provenance"), ("data", "preparation receipt"),
+])
+def test_stage1_comparison_rejects_mismatched_initialization_and_provenance(
+        stage_comparison_artifacts, monkeypatch, change, match):
+    args, manifest, first, _ = stage_comparison_artifacts
+    config, _, _, precision, identity, provenance = audit.validate_run(runtime, args, manifest)
+    if change == "initial_bridge":
+        # Readers/gates may differ while compressors still match. The full hash must bind them.
+        provenance["initial_bridge_sha256"] = "other-readers-with-same-compressors"
+    elif change == "compressor":
+        monkeypatch.setattr(runtime, "checkpoint_compressor_hash", lambda _: "wrong")
+    elif change in ("code", "precision"):
+        value = audit.read_json(args.run_dir / "outputs/stage1/environment.json")
+        value["source" if change == "code" else "precision"] = "wrong"
+        write_json(args.run_dir / "outputs/stage1/environment.json", value)
+    elif change == "incomplete":
+        value = audit.read_json(first / "runtime.json")
+        value["complete"] = False
+        write_json(first / "runtime.json", value)
+    elif change == "architecture":
+        value = audit.read_json(first / "checkpoint.json")
+        value["config"]["bridge"]["num_slots"] += 1
+        write_json(first / "checkpoint.json", value)
+    elif change == "state":
+        value = torch.load(first / "training_state.pt", weights_only=False)
+        value["progress"]["step"] -= 1
+        torch.save(value, first / "training_state.pt")
+    elif change == "data":
+        value = audit.read_json(args.data_dir / "preparation.json")
+        value["files"]["stage1/train.jsonl"]["sha256"] = "changed"
+        write_json(args.data_dir / "preparation.json", value)
+    with pytest.raises(ValueError, match=match):
+        audit.validate_stage1_for_comparison(runtime, args, config, precision, identity, provenance)
+
+
+def test_main_compares_stages_with_one_receiver_same_inputs_and_no_training(
+        stage_comparison_artifacts, setup, tmp_path, monkeypatch):
+    args, _, first, final = stage_comparison_artifacts
+    config, model, _, _, _ = setup
+    monkeypatch.setattr(audit, "import_training_code", lambda *_: (runtime, data_utils, scoring))
+    monkeypatch.setattr(audit, "git_head", lambda *_: "audit-source")
+    monkeypatch.setattr(runtime, "initialize_distributed", lambda: DistributedContext())
+    monkeypatch.setattr(runtime, "load_tokenizer", lambda *_: CharTokenizer())
+    builds, loads, evaluations = [], [], []
+    def build(selected_config, *_args, **kwargs):
+        assert selected_config.data.response_format == "mcq" and kwargs == {"load_encoder": False}
+        builds.append(selected_config)
+        return model
+    original_load, original_evaluate = runtime.load_bridge, audit.evaluate_controls
+    def load(path, bridge):
+        loads.append(path)
+        return original_load(path, bridge)
+    def evaluate(*positional, **kwargs):
+        evaluations.append((positional[2], positional[4].model_dump(), kwargs["seed"]))
+        return original_evaluate(*positional, **kwargs)
+    monkeypatch.setattr(runtime, "build_runtime_model", build)
+    monkeypatch.setattr(runtime, "load_bridge", load)
+    monkeypatch.setattr(audit, "evaluate_controls", evaluate)
+    monkeypatch.setattr(runtime, "train", lambda *_: pytest.fail("Audit trained a model"))
+    monkeypatch.setattr(torch.optim.AdamW, "step", lambda *_: pytest.fail("Audit made an optimizer update"))
+    files = list(args.run_dir.rglob("*")) + list(args.data_dir.rglob("*"))
+    before = {path: audit.file_hash(path) for path in files if path.is_file()}
+    output = tmp_path / "comparison-output"
+    assert audit.main(["--run-dir", str(args.run_dir), "--data-dir", str(args.data_dir),
+        "--packet-cache", str(args.packet_cache), "--training-repo", str(tmp_path / "training-source"),
+        "--output", str(output), "--compare-stage1"]) == 0
+    assert len(builds) == 1 and loads == [first, final]
+    assert len(evaluations) == 2 and evaluations[0] == evaluations[1]
+    comparison = audit.read_json(output / "stage_comparison.json")
+    assert comparison["examples"] == 5
+    assert set(comparison["comparisons"]) == set(audit.MODES)
+    assert comparison["protocol"]["comparison_direction"] == "stage2_minus_stage1"
+    assert comparison["stages"]["stage1"]["reproduction_check"]["status"] == "not_applicable"
+    for stage in ("stage1", "stage2"):
+        assert (output / stage / "cloth_examples.jsonl").is_file()
+        assert (output / stage / "predictions.jsonl").is_file()
+    for mode in ("query_only", "raw_text"):
+        assert comparison["baseline_checks"][mode]["matches"]
+        assert comparison["comparisons"][mode]["prediction_flips"] == 0
+        assert comparison["comparisons"][mode]["loss_delta"] == 0
+    first_rows = [json.loads(line) for line in (output / "stage1/predictions.jsonl").read_text().splitlines()]
+    final_rows = [json.loads(line) for line in (output / "stage2/predictions.jsonl").read_text().splitlines()]
+    assert any(a["option_scores"] != b["option_scores"] for a, b in zip(first_rows, final_rows)
+               if a["mode"] == "actual_packet")
+    assert before == {path: audit.file_hash(path) for path in before}
+
+
+def test_stage_comparison_refuses_changed_bridge_free_baselines(setup):
+    config, model, examples, packets, _ = setup
+    results, _ = audit.evaluate_controls(runtime, model, examples, packets, config,
+        DistributedContext(), tokenizer=CharTokenizer(), scoring=scoring)
+    final = deepcopy(results)
+    final["query_only"][0]["nll"] += 0.1
+    summaries = {stage: audit.make_summary(rows, examples, scoring, {})
+                 for stage, rows in (("stage1", results), ("stage2", final))}
+    with pytest.raises(ValueError, match="baseline query_only changed"):
+        audit.make_stage_comparison({"stage1": results, "stage2": final}, summaries)

@@ -148,3 +148,31 @@ def test_benchmark_flag_is_forwarded_to_fork_script(remote, tmp_path, monkeypatc
     record = json.loads(log.read_text().splitlines()[0])
     arguments = record["args"]
     assert arguments[arguments.index("--benchmark-microbatches") + 1] == "3"
+
+
+@pytest.mark.parametrize("compare", [False, True])
+def test_audit_comparison_flag_reaches_fork_without_training(remote, tmp_path, monkeypatch, compare):
+    (remote / "kaggle/audit.py").write_text("# evaluator\n", encoding="utf-8")
+    git(remote, "add", ".")
+    git(remote, "commit", "--no-gpg-sign", "-m", "Add evaluator")
+    log = tmp_path / "calls.jsonl"
+    monkeypatch.setenv("BOOTSTRAP_LOG", str(log))
+    original = tmp_path / "finished"
+    original.mkdir()
+    (original / "keep").write_text("original", encoding="utf-8")
+    command = ["--repo-url", str(remote), "--repo-dir", str(tmp_path / "tools"),
+               "--workdir", str(tmp_path / "controls"), "--action", "audit",
+               "--audit-run", str(original), "--training-repo", str(tmp_path / "source"), "--skip-setup"]
+    assert bootstrap.main(command + (["--compare-stage1"] if compare else [])) == 0
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    assert len(records) == 1 and records[0]["args"][0] == "audit"
+    assert ("--compare-stage1" in records[0]["args"]) == compare
+    assert (original / "keep").read_text() == "original"
+    assert not (original / "manifest.json").exists()
+
+
+def test_stage_comparison_requires_audit_action_before_checkout(monkeypatch):
+    monkeypatch.setattr(bootstrap, "checkout", lambda *_: pytest.fail("cloned before rejecting invalid action"))
+    with pytest.raises(SystemExit) as caught:
+        bootstrap.main(["--action", "all", "--compare-stage1"])
+    assert caught.value.code == 2
